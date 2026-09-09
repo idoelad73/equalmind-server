@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { query } from '../db/pool.js'
+import { AppError } from '../lib/AppError.js'
 
 /**
  * Interest submitted through the public form. This creates no account and
@@ -15,6 +16,7 @@ export const orgRequestSchema = z.object({
   orgAddress: z.string().trim().max(250).optional(),
   industry: z.string().trim().min(2).max(120),
   companyNumber: z.string().trim().max(30).optional(),
+  registrySource: z.enum(['companies', 'nonprofits']).optional(),
   employeeCount: z.coerce.number().int().min(0).max(1_000_000).optional(),
   extraNotes: z.string().trim().max(1000).optional(),
 })
@@ -50,4 +52,34 @@ export async function postActivate(req, res) {
     [req.user.id],
   )
   res.json({ activated: rowCount > 0 })
+}
+
+/**
+ * A regular user's self-declared workplace, set from their profile page.
+ *
+ * It goes through the server because `profiles` has no UPDATE policy for end
+ * users - deliberately, since RLS cannot restrict which columns a policy
+ * exposes and any such policy would also put user_type within reach. Here the
+ * update names its three columns explicitly.
+ */
+export const affiliationSchema = z.object({
+  name: z.string().trim().min(2).max(150).nullable(),
+  registryId: z.string().trim().max(30).nullable().optional(),
+  source: z.enum(['companies', 'nonprofits']).nullable().optional(),
+})
+
+export async function putAffiliation(req, res) {
+  const { name, registryId, source } = req.body
+
+  const { rowCount } = await query(
+    `update public.profiles
+        set org_name = $2,
+            org_registry_id = $3,
+            org_registry_source = $4
+      where id = $1`,
+    [req.user.id, name, name ? (registryId ?? null) : null, name ? (source ?? null) : null],
+  )
+
+  if (!rowCount) throw AppError.notFound('הפרופיל לא נמצא.')
+  res.json({ saved: true, organization: name ? { name, registryId, source } : null })
 }

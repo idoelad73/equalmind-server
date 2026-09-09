@@ -2,7 +2,13 @@ import { Router } from 'express'
 import { validate } from '../middlewares/validate.js'
 import { rateLimit } from '../middlewares/rateLimit.js'
 import { requireAuth } from '../middlewares/requireAuth.js'
-import { orgRequestSchema, postActivate, postOrgRequest } from '../controllers/org.controller.js'
+import {
+  affiliationSchema,
+  orgRequestSchema,
+  postActivate,
+  postOrgRequest,
+  putAffiliation,
+} from '../controllers/org.controller.js'
 
 export const orgRouter = Router()
 
@@ -15,3 +21,4 @@ orgRouter.post(
 )
 
 orgRouter.post('/activate', requireAuth, postActivate)
+orgRouter.put('/affiliation', requireAuth, validate({ body: affiliationSchema }), putAffiliation)
