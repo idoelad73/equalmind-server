@@ -1,0 +1,4 @@
+﻿org_name,email,full_name,mobile,industry,company_number,employees
+"בנק לדוגמה",admin@example-bank.co.il,"דנה כהן",0501234567,"פיננסים",512345678,1200
+"עיריית דוגמה",hr@example-city.muni.il,"יוסי לוי",0521234567,"ציבורי",,850
+"סטארטאפ דוגמה",people@example-startup.com,,,"טכנולוגיה",,45

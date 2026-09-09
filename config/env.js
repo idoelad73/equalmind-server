@@ -15,6 +15,22 @@ const schema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
 
   DATABASE_URL: z.string().min(1),
+
+  // ---- Cloudinary ----
+  // Optional at boot so the server runs before the keys are filled in;
+  // lib/cloudinary.js reports a clear error if a media route is called
+  // without them.
+  CLOUDINARY_CLOUD_NAME: z.string().default(''),
+  CLOUDINARY_API_KEY: z.string().default(''),
+  CLOUDINARY_API_SECRET: z.string().default(''),
+  CLOUDINARY_FOLDER: z.string().default('equalmind'),
+  // Enables genuinely time-limited delivery URLs. Cloudinary calls this
+  // "token-based authentication" and it is a paid add-on; without the key,
+  // delivery URLs are signed but do not expire. Settings -> Security.
+  CLOUDINARY_AUTH_TOKEN_KEY: z.string().default(''),
+  // Largest image accepted, in bytes. Multer rejects anything above it before
+  // a single byte reaches Cloudinary.
+  UPLOAD_MAX_BYTES: z.coerce.number().int().positive().default(8 * 1024 * 1024),
 })
 
 const parsed = schema.safeParse(process.env)
