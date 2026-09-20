@@ -5,6 +5,10 @@ import {
   byIdSchema,
   getCompanies,
   getCompanyById,
+  getLocalities,
+  getLocalityByCoords,
+  localityCoordsSchema,
+  localitySearchSchema,
   lookupSchema,
 } from '../controllers/registry.controller.js'
 
@@ -17,3 +21,9 @@ registryRouter.use(rateLimit({ windowMs: 60_000, max: 60 }))
 
 registryRouter.get('/companies', validate({ query: lookupSchema }), getCompanies)
 registryRouter.get('/companies/by-id', validate({ query: byIdSchema }), getCompanyById)
+registryRouter.get('/localities', validate({ query: localitySearchSchema }), getLocalities)
+registryRouter.get(
+  '/localities/by-coords',
+  validate({ query: localityCoordsSchema }),
+  getLocalityByCoords,
+)

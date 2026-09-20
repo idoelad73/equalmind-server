@@ -48,3 +48,50 @@ export function singleImage(field = 'photo') {
       next(error)
     })
 }
+
+/* ------------------------------------------------------------ roster CSV */
+
+// Browsers disagree about what a .csv is: Chrome on Windows often reports the
+// Excel type because Excel owns the extension. The extension is checked too,
+// and the content is parsed strictly either way - this filter only keeps
+// obviously wrong files from being buffered.
+const CSV_MIME = new Set([
+  'text/csv',
+  'text/plain',
+  'application/csv',
+  'application/vnd.ms-excel',
+  'application/octet-stream',
+])
+
+const CSV_MAX_BYTES = 2 * 1024 * 1024 // ~40k employees
+
+const csvUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CSV_MAX_BYTES, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const looksCsv = /\.csv$/i.test(file.originalname ?? '')
+    if (!looksCsv || !CSV_MIME.has(file.mimetype)) {
+      return cb(AppError.badRequest('יש להעלות קובץ CSV. אפשר לשמור מאקסל כ־CSV.'))
+    }
+    cb(null, true)
+  },
+})
+
+/** Accepts one CSV on the `file` field. */
+export function singleCsv(field = 'file') {
+  const handler = csvUpload.single(field)
+
+  return (req, res, next) =>
+    handler(req, res, (error) => {
+      if (!error) return next()
+
+      if (error instanceof multer.MulterError) {
+        const message =
+          error.code === 'LIMIT_FILE_SIZE'
+            ? `הקובץ גדול מדי. הגודל המרבי הוא ${Math.round(CSV_MAX_BYTES / 1024 / 1024)}MB.`
+            : 'העלאת הקובץ נכשלה.'
+        return next(AppError.badRequest(message))
+      }
+      next(error)
+    })
+}

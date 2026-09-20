@@ -142,16 +142,35 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function ensureOrganization(row) {
+  // Registry number first, name only as a fallback - see invite-org-admin.mjs.
   const { rows: found } = await query(
-    'select * from public.organizations where lower(name) = lower($1)',
-    [row.orgName],
+    `select * from public.organizations
+      where (registry_id is not null
+             and registry_id = public.normalize_registry_id($2))
+         or lower(name) = lower($1)
+      order by (registry_id is not null and
+                registry_id = public.normalize_registry_id($2)) desc
+      limit 1`,
+    [row.orgName, row.companyNumber ?? null],
   )
   if (found.length) return { org: found[0], created: false }
 
   const { rows } = await query(
-    `insert into public.organizations (name, industry, company_number, employee_count)
-     values ($1,$2,$3,$4) returning *`,
-    [row.orgName, row.industry, row.companyNumber, row.employeeCount],
+    `insert into public.organizations
+       (name, industry, registry_id, registry_source, employee_count)
+     values ($1,$2,$3,$4,$5) returning *`,
+    [
+      row.orgName,
+      row.industry,
+      row.companyNumber,
+      // 58 is the עמותות block; 51-57 are companies.
+      row.companyNumber
+        ? (String(row.companyNumber).replace(/\D/g, '').startsWith('58')
+            ? 'nonprofits'
+            : 'companies')
+        : null,
+      row.employeeCount,
+    ],
   )
   return { org: rows[0], created: true }
 }

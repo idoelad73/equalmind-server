@@ -16,6 +16,16 @@ const schema = z.object({
 
   DATABASE_URL: z.string().min(1),
 
+  // ---- Employee roster ----
+  // Secret for the HMAC that employee phone numbers are stored under.
+  // Optional at boot so the server runs before it is set; lib/rosterHash.js
+  // raises a clear error if a roster route is called without it.
+  //
+  // THIS CANNOT BE ROTATED. There is no plaintext to re-hash from, so
+  // changing or losing it orphans every unclaimed roster row and every
+  // roster has to be re-imported. Back it up with the database.
+  ROSTER_HASH_SECRET: z.string().default(''),
+
   // ---- Cloudinary ----
   // Optional at boot so the server runs before the keys are filled in;
   // lib/cloudinary.js reports a clear error if a media route is called

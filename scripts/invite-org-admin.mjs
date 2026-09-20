@@ -61,9 +61,18 @@ async function main() {
     if (!rows.length) throw new Error(`No organisation with id ${args['org-id']}`)
     organization = rows[0]
   } else {
+    // Registry number first, name only as a fallback. The number is the
+    // identity; matching on name alone would try to insert a second row for
+    // an organisation we already have and hit the unique index instead.
     const { rows: existing } = await query(
-      'select * from public.organizations where lower(name) = lower($1)',
-      [orgName],
+      `select * from public.organizations
+        where (registry_id is not null
+               and registry_id = public.normalize_registry_id($2))
+           or lower(name) = lower($1)
+        order by (registry_id is not null and
+                  registry_id = public.normalize_registry_id($2)) desc
+        limit 1`,
+      [orgName, args['company-number'] ?? null],
     )
     if (existing.length) {
       organization = existing[0]
@@ -74,13 +83,19 @@ async function main() {
     } else {
       const { rows } = await query(
         `insert into public.organizations
-           (name, industry, company_number, employee_count)
-         values ($1, $2, $3, $4)
+           (name, industry, registry_id, registry_source, employee_count)
+         values ($1, $2, $3, $4, $5)
          returning *`,
         [
           orgName,
           args.industry ?? null,
           args['company-number'] ?? null,
+          // 58 is the עמותות block; 51-57 are companies.
+          args['company-number']
+            ? (String(args['company-number']).replace(/\D/g, '').startsWith('58')
+                ? 'nonprofits'
+                : 'companies')
+            : null,
           args.employees ? Number(args.employees) : null,
         ],
       )

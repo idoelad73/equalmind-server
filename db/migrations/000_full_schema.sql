@@ -1,5 +1,23 @@
 -- =====================================================================
--- Equalmind - complete schema, for a fresh Supabase project
+-- ⚠ NO LONGER COMPLETE.
+--
+-- This file stops at migration 007. A fresh project also needs, in order:
+--
+--   009_behaviors.sql                  the behaviour catalogue
+--   010_reports.sql                    reports
+--   011_reports_reporter_and_org.sql   reports.user_id + organization_id
+--   012_one_organization_identity.sql  one identity per organisation
+--   013_org_roster_and_join_code.sql   employee roster + join code
+--   014_drop_employee_list_storage.sql removes the bucket 000 creates
+--
+-- 008 applies only to a database created from this file, since it edits a
+-- policy this file already defines.
+--
+-- Do not treat this file alone as the schema.
+-- =====================================================================
+
+-- =====================================================================
+-- Equalmind - schema up to migration 007, for a fresh Supabase project
 --
 -- Paste this whole file into the SQL editor and run it once.
 --
