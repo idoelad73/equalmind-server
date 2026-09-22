@@ -19,12 +19,15 @@ export async function getBehaviors(req, res) {
     `select id, category_key, category_label, name
        from public.behaviors
       where space = $1 and is_active
-      order by category_key, sort_order, name`,
+      order by category_order, category_key, sort_order, name`,
     [space],
   )
 
   // Category order follows first appearance, which the ORDER BY above has
   // already settled - so the list and the category cards cannot disagree.
+  // category_order comes first in that sort because display order is a
+  // product decision; ordering by the slug alone is alphabetical, which is
+  // to say arbitrary.
   const categories = []
   const seen = new Map()
 

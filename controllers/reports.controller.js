@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { AppError } from '../lib/AppError.js'
+import { getSignedUrl } from '../lib/mediaProvider.js'
 
 const optionalText = (max) =>
   z
@@ -112,6 +113,9 @@ export const orgReportsQuerySchema = z.object({
  * auth.users. An org admin is frequently the person a report is about, so the
  * reporter's identity reaching this response is the one failure that matters.
  *
+ * photo_public_id is selected but deliberately NOT returned: it is exchanged
+ * for a freshly signed link below, so the raw id never leaves the server.
+ *
  * The organisation comes from `req.orgAdmin`, which requireOrgAdmin read from
  * the database. Nothing about the scope is taken from the request.
  */
@@ -132,12 +136,25 @@ export async function listOrganizationReports(req, res) {
     [req.orgAdmin.organizationId, space, before ?? null, limit],
   )
 
+  // The photo link is minted here, per request, rather than stored on the
+  // row. Without CLOUDINARY_AUTH_TOKEN_KEY a signed Cloudinary URL does not
+  // expire, so a stored one would make every database row a permanent,
+  // working link to evidence about an identifiable person - and a leaked
+  // backup a photo gallery. Minting keeps the link's life tied to a request
+  // by an authorised admin, and swapping storage provider stays a one-file
+  // change rather than a data migration.
+  const reports = rows.map(({ photo_public_id, ...report }) => {
+    if (!photo_public_id) return { ...report, photo: null }
+    const { url, expiresInSeconds } = getSignedUrl(photo_public_id, { width: 1200 })
+    return { ...report, photo: { url, expiresInSeconds } }
+  })
+
   res.json({
     space,
-    count: rows.length,
+    count: reports.length,
     // Cursor rather than an offset: reports arrive constantly, and an offset
     // would repeat or skip rows as the list shifts underneath.
-    nextBefore: rows.length === limit ? rows[rows.length - 1].created_at : null,
-    reports: rows,
+    nextBefore: reports.length === limit ? reports[reports.length - 1].created_at : null,
+    reports,
   })
 }

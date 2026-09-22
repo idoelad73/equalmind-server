@@ -26,6 +26,30 @@ const schema = z.object({
   // roster has to be re-imported. Back it up with the database.
   ROSTER_HASH_SECRET: z.string().default(''),
 
+  // ---- SMS ----
+  // 'mock' sends nothing and records everything. It is the default on
+  // purpose: a misconfigured environment should fail to reach anybody
+  // rather than quietly message a real roster. Opting into a real gateway
+  // is an explicit change, never inferred from credentials being present.
+  SMS_PROVIDER: z.enum(['mock', 'sms4free']).default('mock'),
+  // Sender shown on the handset. Israel requires an alphanumeric sender to
+  // be pre-registered with the gateway; until then this is a number.
+  SMS_SENDER: z.string().default('Equalmind'),
+  // Public URL an invited employee is sent to. Not CLIENT_ORIGIN, because
+  // in development that is localhost and useless in a real message.
+  SMS_INVITE_URL: z.string().default('http://localhost:5173/register'),
+
+  // Comma-separated numbers. While this is NON-EMPTY, only these numbers
+  // are actually sent to and everything else is recorded as 'skipped'.
+  // It is what makes "send to the whole roster" safe to develop against:
+  // the code path runs in full, the messages are recorded, and nobody
+  // else's phone rings. Empty means no restriction - production.
+  SMS_ALLOWLIST: z.string().default(''),
+
+  SMS4FREE_KEY: z.string().default(''),
+  SMS4FREE_USER: z.string().default(''),
+  SMS4FREE_PASSWORD: z.string().default(''),
+
   // ---- Cloudinary ----
   // Optional at boot so the server runs before the keys are filled in;
   // lib/cloudinary.js reports a clear error if a media route is called

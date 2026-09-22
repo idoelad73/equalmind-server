@@ -4,6 +4,17 @@ import { AppError } from '../lib/AppError.js'
 import { normalizePhone } from '../lib/phone.js'
 import { generateJoinCode, hashPhone, normalizeJoinCode } from '../lib/rosterHash.js'
 import { applyRoster, planRoster, tally } from '../lib/rosterImport.js'
+import { maskPhone } from '../lib/rosterImport.js'
+import {
+  activeProvider,
+  allowlistActive,
+  DEFAULT_INVITE_TEMPLATE,
+  isDryProvider,
+  MESSAGES,
+  segmentsFor,
+  sendSms,
+} from '../lib/smsProvider.js'
+import { env } from '../config/env.js'
 
 /**
  * Interest submitted through the public form. This creates no account and
@@ -70,7 +81,8 @@ export async function postActivate(req, res) {
   }
 
   const { rows: details } = await query(
-    `select org_name, registry_id, registry_source, industry, org_address, employee_count
+    `select org_name, registry_id, registry_source, industry, org_address,
+            employee_count, invite_sms_template
        from public.org_admin_details where user_id = $1`,
     [req.user.id],
   )
@@ -95,8 +107,9 @@ export async function postActivate(req, res) {
     if (!id) {
       const { rows: created } = await client.query(
         `insert into public.organizations
-           (name, registry_id, registry_source, industry, address, employee_count)
-         values ($1,$2,$3,$4,$5,$6)
+           (name, registry_id, registry_source, industry, address, employee_count,
+            invite_sms_template)
+         values ($1,$2,$3,$4,$5,$6,$7)
          returning id`,
         [
           declared.org_name,
@@ -105,9 +118,22 @@ export async function postActivate(req, res) {
           declared.industry,
           declared.org_address,
           declared.employee_count,
+          declared.invite_sms_template,
         ],
       )
       id = created[0].id
+    }
+
+    // coalesce, not overwrite: an organisation that already has a template
+    // keeps it. A second admin onboarding does not get to silently reword
+    // what the first one agreed to.
+    if (declared.invite_sms_template) {
+      await client.query(
+        `update public.organizations
+            set invite_sms_template = coalesce(invite_sms_template, $2)
+          where id = $1`,
+        [id, declared.invite_sms_template],
+      )
     }
 
     await client.query(
@@ -349,6 +375,7 @@ export async function postRotateJoinCode(req, res) {
 export async function postRoster(req, res) {
   if (!req.file) throw AppError.badRequest('לא צורף קובץ.')
 
+
   const text = req.file.buffer.toString('utf8')
   const { planned, skipped, error } = planRoster(text, req.orgAdmin.organizationId)
 
@@ -361,6 +388,11 @@ export async function postRoster(req, res) {
     applyRoster(planned, (sql, params) => client.query(sql, params)),
   )
 
+  // Importing never sends. Inviting is a separate, reviewed step through
+  // POST /roster/notify - the client opens the invitation dialog after a
+  // successful import, and a person approves the wording and the count.
+  // A CSV upload that quietly messaged a few hundred people would be the
+  // easiest possible mistake to make and the hardest to take back.
   res.status(201).json({
     // `masked` and `fullName` only - the plan's plaintext numbers never
     // leave the server.
@@ -406,4 +438,268 @@ export async function deleteRoster(req, res) {
     [req.orgAdmin.organizationId],
   )
   res.json({ removed: rowCount })
+}
+
+/* ------------------------------------------------- roster notifications */
+
+export const notifySchema = z.object({
+  // Default true: the destructive reading of an ambiguous request is the
+  // wrong one when the action is "message a list of real people".
+  dryRun: z.boolean().default(true),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  // Message people already invited once. Off by default; a repeated
+  // invitation is the complaint nobody forgives.
+  resend: z.boolean().default(false),
+})
+
+/**
+ * Invite roster members who have not registered yet.
+ *
+ * Only people who are on the roster, have not claimed their row, and - unless
+ * `resend` - have not already been invited. Every message is recorded in
+ * sms_outbox before it is attempted, so a crash mid-run cannot produce a
+ * message nobody knows about.
+ *
+ * `dryRun` returns exactly what would be sent, including the real segment
+ * count, without touching the gateway. That is the default.
+ */
+/**
+ * Build the invitation for an organisation and count what it will cost.
+ *
+ * The template is the organisation's own if it has set one. Segment count is
+ * computed here, not guessed at the call site, because in Hebrew it is the
+ * bill: 70 characters per segment, multiplied by the whole roster.
+ */
+async function invitationFor(organizationId) {
+  const { rows } = await query(
+    'select name, invite_sms_template from public.organizations where id = $1',
+    [organizationId],
+  )
+  if (!rows.length) throw AppError.notFound('הארגון לא נמצא.')
+
+  const body = MESSAGES.rosterInvite({
+    organizationName: rows[0].name,
+    url: env.SMS_INVITE_URL,
+    template: rows[0].invite_sms_template,
+  })
+
+  return { organizationName: rows[0].name, body, cost: segmentsFor(body) }
+}
+
+/**
+ * Send the invitation to roster members who have not registered.
+ *
+ * Shared by POST /roster/notify and the `notify` option on upload, so both
+ * obey the same rules: never someone already claimed, never someone already
+ * invited unless `resend`, never someone whose number was not stored.
+ *
+ * Each message is written to sms_outbox BEFORE it is attempted, so a process
+ * that dies mid-run still leaves evidence of what it tried.
+ */
+async function sendInvitations({ organizationId, userId, limit, resend }) {
+  const { body, cost } = await invitationFor(organizationId)
+
+  const { rows: targets } = await query(
+    `select id, phone, employee_name
+       from public.org_rosters
+      where organization_id = $1
+        and claimed_at is null
+        and phone is not null
+        ${resend ? '' : 'and invited_at is null'}
+      order by employee_name
+      limit $2`,
+    [organizationId, limit],
+  )
+
+  const results = []
+
+  for (const target of targets) {
+    const { rows: [row] } = await query(
+      `insert into public.sms_outbox
+         (provider, kind, phone, body, organization_id, roster_id, requested_by, status)
+       values ($1, 'roster_invite', $2, $3, $4, $5, $6, 'queued')
+       on conflict (roster_id) where roster_id is not null and kind = 'roster_invite'
+       do update
+          set provider = excluded.provider, body = excluded.body,
+              status = 'queued', error = null, created_at = now()
+       returning id`,
+      [activeProvider(), target.phone, body, organizationId, target.id, userId],
+    )
+
+    try {
+      const { provider, ref, skipped, reason } = await sendSms({ to: target.phone, body })
+
+      if (skipped) {
+        // The allowlist declined it. Not a failure, and deliberately NOT
+        // stamped as invited - so a later real send still has them to reach.
+        await query(
+          `update public.sms_outbox set status = 'skipped', error = $2 where id = $1`,
+          [row.id, reason],
+        )
+        results.push({
+          name: target.employee_name,
+          masked: maskPhone(target.phone),
+          status: 'skipped',
+          detail: 'מחוץ לרשימת הבדיקה',
+        })
+        continue
+      }
+
+      await query(
+        `update public.sms_outbox
+            set status = 'sent', provider = $2, provider_ref = $3, sent_at = now()
+          where id = $1`,
+        [row.id, provider, ref],
+      )
+      await query('update public.org_rosters set invited_at = now() where id = $1', [target.id])
+      results.push({ name: target.employee_name, masked: maskPhone(target.phone), status: 'sent' })
+    } catch (error) {
+      await query(
+        `update public.sms_outbox set status = 'failed', error = $2 where id = $1`,
+        [row.id, error?.message ?? 'unknown'],
+      )
+      results.push({
+        name: target.employee_name,
+        masked: maskPhone(target.phone),
+        status: 'failed',
+        detail: error?.message ?? 'שליחה נכשלה',
+      })
+    }
+  }
+
+  return { body, cost, results, summary: tally(results) }
+}
+
+export async function postRosterNotify(req, res) {
+  const { dryRun, limit, resend } = req.body
+  const { body, cost } = await invitationFor(req.orgAdmin.organizationId)
+
+  // Rows with no stored number cannot be reached: a hash is not reversible.
+  const { rows: [{ unreachable }] } = await query(
+    `select count(*)::int as unreachable
+       from public.org_rosters
+      where organization_id = $1 and claimed_at is null and phone is null`,
+    [req.orgAdmin.organizationId],
+  )
+
+  if (dryRun) {
+    const { rows: targets } = await query(
+      `select phone, employee_name from public.org_rosters
+        where organization_id = $1 and claimed_at is null and phone is not null
+          ${resend ? '' : 'and invited_at is null'}
+        order by employee_name limit $2`,
+      [req.orgAdmin.organizationId, limit],
+    )
+    return res.json({
+      provider: activeProvider(),
+      allowlist: allowlistActive(),
+      dryRun: true,
+      body,
+      segments: cost.segments,
+      unicode: cost.unicode,
+      recipients: targets.length,
+      unreachable,
+      totalSegments: cost.segments * targets.length,
+      results: targets.map((t) => ({
+        name: t.employee_name,
+        masked: maskPhone(t.phone),
+        status: 'planned',
+      })),
+    })
+  }
+
+  const sent = await sendInvitations({
+    organizationId: req.orgAdmin.organizationId,
+    userId: req.user.id,
+    limit,
+    resend,
+  })
+
+  res.json({
+    provider: activeProvider(),
+    allowlist: allowlistActive(),
+    dryRun: false,
+    body: sent.body,
+    segments: sent.cost.segments,
+    unicode: sent.cost.unicode,
+    recipients: sent.results.length,
+    unreachable,
+    totalSegments: sent.cost.segments * sent.results.length,
+    results: sent.results,
+    summary: sent.summary,
+  })
+}
+
+/** What has been sent for this organisation. Most recent first. */
+export async function getSmsOutbox(req, res) {
+  const { rows } = await query(
+    `select o.id, o.provider, o.kind, o.status, o.created_at, o.sent_at, o.error,
+            r.employee_name
+       from public.sms_outbox o
+       left join public.org_rosters r on r.id = o.roster_id
+      where o.organization_id = $1
+      order by o.created_at desc
+      limit 100`,
+    [req.orgAdmin.organizationId],
+  )
+
+  // The number is deliberately not returned: an admin who can see the
+  // roster already knows who is on it, and a list of numbers in an API
+  // response is one screenshot away from somewhere it should not be.
+  res.json({ provider: activeProvider(), dry: isDryProvider(), messages: rows })
+}
+
+/* ------------------------------------------------------ message template */
+
+export const templateSchema = z.object({
+  // null clears it, which falls back to the built-in default.
+  template: z.string().trim().max(280, 'ההודעה ארוכה מדי').nullable(),
+})
+
+/** The organisation's invitation text, and what the default would be. */
+export async function getTemplate(req, res) {
+  const { rows } = await query(
+    'select name, invite_sms_template from public.organizations where id = $1',
+    [req.orgAdmin.organizationId],
+  )
+  if (!rows.length) throw AppError.notFound('הארגון לא נמצא.')
+
+  const template = rows[0].invite_sms_template
+  const preview = MESSAGES.rosterInvite({
+    organizationName: rows[0].name,
+    url: env.SMS_INVITE_URL,
+    template,
+  })
+
+  res.json({
+    organization: rows[0].name,
+    template,
+    defaultTemplate: DEFAULT_INVITE_TEMPLATE,
+    maxLength: 280,
+    // The preview is what would actually be sent, with placeholders filled,
+    // so the segment count is the real one rather than an estimate from the
+    // unrendered template.
+    preview,
+    ...segmentsFor(preview),
+  })
+}
+
+export async function putTemplate(req, res) {
+  const template = req.body.template || null
+
+  const { rows } = await query(
+    `update public.organizations set invite_sms_template = $2
+      where id = $1
+      returning name, invite_sms_template`,
+    [req.orgAdmin.organizationId, template],
+  )
+  if (!rows.length) throw AppError.notFound('הארגון לא נמצא.')
+
+  const preview = MESSAGES.rosterInvite({
+    organizationName: rows[0].name,
+    url: env.SMS_INVITE_URL,
+    template: rows[0].invite_sms_template,
+  })
+
+  res.json({ saved: true, template: rows[0].invite_sms_template, preview, ...segmentsFor(preview) })
 }

@@ -11,15 +11,21 @@ import {
   deleteRoster,
   getJoinCode,
   getRoster,
+  getSmsOutbox,
+  getTemplate,
   joinByCodeSchema,
+  notifySchema,
   orgRequestSchema,
   postActivate,
   postClaimByPhone,
   postJoinByCode,
   postOrgRequest,
   postRoster,
+  postRosterNotify,
   postRotateJoinCode,
   putAffiliation,
+  putTemplate,
+  templateSchema,
 } from '../controllers/org.controller.js'
 
 export const orgRouter = Router()
@@ -67,3 +73,29 @@ orgRouter.post('/join-code/rotate', requireAuth, requireOrgAdmin, postRotateJoin
 orgRouter.get('/roster', requireAuth, requireOrgAdmin, getRoster)
 orgRouter.post('/roster', requireAuth, requireOrgAdmin, singleCsv('file'), postRoster)
 orgRouter.delete('/roster', requireAuth, requireOrgAdmin, deleteRoster)
+
+// Messaging the roster. Rate limited hard: this is the one endpoint that
+// reaches people who never signed up, and Israel's Anti-Spam Law prices a
+// mistake at up to NIS 1,000 per message. dryRun defaults to true.
+orgRouter.post(
+  '/roster/notify',
+  requireAuth,
+  requireOrgAdmin,
+  rateLimit({ windowMs: 60 * 60_000, max: 5 }),
+  validate({ body: notifySchema }),
+  postRosterNotify,
+)
+
+orgRouter.get('/sms', requireAuth, requireOrgAdmin, getSmsOutbox)
+
+// The invitation text. Read and written by the organisation's own admin;
+// the length cap is enforced here and again by a check constraint, because
+// an over-long template costs money on every recipient.
+orgRouter.get('/template', requireAuth, requireOrgAdmin, getTemplate)
+orgRouter.put(
+  '/template',
+  requireAuth,
+  requireOrgAdmin,
+  validate({ body: templateSchema }),
+  putTemplate,
+)
