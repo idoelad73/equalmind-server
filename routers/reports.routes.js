@@ -4,6 +4,8 @@ import { requireOrgAdmin } from '../middlewares/requireOrgAdmin.js'
 import { rateLimit } from '../middlewares/rateLimit.js'
 import { validate } from '../middlewares/validate.js'
 import {
+  createCustomReport,
+  createCustomReportSchema,
   createReport,
   createReportSchema,
   listOrganizationReports,
@@ -19,6 +21,15 @@ reportsRouter.post(
   rateLimit({ windowMs: 60_000, max: 10 }),
   validate({ body: createReportSchema }),
   createReport,
+)
+
+// A Hook that is not in the catalogue. Separate from POST / so the catalogue
+// path keeps deriving its space from the behaviour row.
+reportsRouter.post(
+  '/custom',
+  rateLimit({ windowMs: 60_000, max: 10 }),
+  validate({ body: createCustomReportSchema }),
+  createCustomReport,
 )
 
 // The only way to read a report, and it is scoped to the caller's own

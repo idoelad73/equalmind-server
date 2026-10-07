@@ -68,17 +68,24 @@ async function findTarget() {
     // Still look for a roster row, so the message names the right
     // organisation and the send is recorded against it.
     const { rows } = await query(
-      `select r.id, r.employee_name, r.phone, r.organization_id, o.name as org
+      `select r.id, r.employee_name, r.phone, r.organization_id,
+              o.name as org, o.invite_sms_template as template
          from public.org_rosters r
          join public.organizations o on o.id = r.organization_id
         where r.phone = $1`,
       [e164],
     )
-    return rows[0] ?? { id: null, employee_name: null, phone: e164, organization_id: null, org: null }
+    return (
+      rows[0] ?? {
+        id: null, employee_name: null, phone: e164,
+        organization_id: null, org: null, template: null,
+      }
+    )
   }
 
   const { rows } = await query(
-    `select r.id, r.employee_name, r.phone, r.organization_id, o.name as org
+    `select r.id, r.employee_name, r.phone, r.organization_id,
+            o.name as org, o.invite_sms_template as template
        from public.org_rosters r
        join public.organizations o on o.id = r.organization_id
       where ${args['roster-id'] ? 'r.id = $1' : 'r.employee_name = $1'}`,
@@ -99,11 +106,16 @@ async function findTarget() {
 async function main() {
   const target = await findTarget()
 
+  // The organisation's own template when it has one, so this sends exactly
+  // what the dashboard would send. Without passing it, the script would
+  // quietly fall back to the built-in default and "test" a message nobody
+  // is actually going to receive.
   const body =
     args.message ??
     MESSAGES.rosterInvite({
       organizationName: target.org ?? 'Equalmind',
       url: env.SMS_INVITE_URL,
+      template: target.template,
     })
 
   const cost = segmentsFor(body)
@@ -112,6 +124,7 @@ async function main() {
   console.log(`sender       ${env.SMS_SENDER}`)
   console.log(`to           ${formatPhone(target.phone)}   ${target.employee_name ?? '(not on a roster)'}`)
   if (target.org) console.log(`organisation ${target.org}`)
+  console.log(`message      ${args.message ? 'override from --message' : target.template ? "the organisation's own" : 'built-in default'}`)
   console.log(`segments     ${cost.segments}${cost.unicode ? '  (unicode - Hebrew is 70 chars per segment)' : ''}`)
   console.log(`\n${body.split('\n').map((l) => '  | ' + l).join('\n')}\n`)
 

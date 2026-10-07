@@ -49,37 +49,40 @@ export function singleImage(field = 'photo') {
     })
 }
 
-/* ------------------------------------------------------------ roster CSV */
+/* --------------------------------------------------- roster spreadsheet */
 
 // Browsers disagree about what a .csv is: Chrome on Windows often reports the
 // Excel type because Excel owns the extension. The extension is checked too,
 // and the content is parsed strictly either way - this filter only keeps
 // obviously wrong files from being buffered.
-const CSV_MIME = new Set([
+const ROSTER_MIME = new Set([
   'text/csv',
   'text/plain',
   'application/csv',
   'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/octet-stream',
 ])
 
-const CSV_MAX_BYTES = 2 * 1024 * 1024 // ~40k employees
+const ROSTER_MAX_BYTES = 2 * 1024 * 1024 // ~40k employees
 
-const csvUpload = multer({
+// .xlsx only, not the legacy binary .xls: the reader handles the modern
+// format, and Excel saves as .xlsx by default.
+const rosterUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: CSV_MAX_BYTES, files: 1 },
+  limits: { fileSize: ROSTER_MAX_BYTES, files: 1 },
   fileFilter: (_req, file, cb) => {
-    const looksCsv = /\.csv$/i.test(file.originalname ?? '')
-    if (!looksCsv || !CSV_MIME.has(file.mimetype)) {
-      return cb(AppError.badRequest('יש להעלות קובץ CSV. אפשר לשמור מאקסל כ־CSV.'))
+    const looksRight = /\.(csv|xlsx)$/i.test(file.originalname ?? '')
+    if (!looksRight || !ROSTER_MIME.has(file.mimetype)) {
+      return cb(AppError.badRequest('יש להעלות קובץ אקסל (xlsx) או CSV.'))
     }
     cb(null, true)
   },
 })
 
-/** Accepts one CSV on the `file` field. */
-export function singleCsv(field = 'file') {
-  const handler = csvUpload.single(field)
+/** Accepts one roster file (.xlsx or .csv) on the `file` field. */
+export function singleRosterFile(field = 'file') {
+  const handler = rosterUpload.single(field)
 
   return (req, res, next) =>
     handler(req, res, (error) => {
@@ -88,7 +91,7 @@ export function singleCsv(field = 'file') {
       if (error instanceof multer.MulterError) {
         const message =
           error.code === 'LIMIT_FILE_SIZE'
-            ? `הקובץ גדול מדי. הגודל המרבי הוא ${Math.round(CSV_MAX_BYTES / 1024 / 1024)}MB.`
+            ? `הקובץ גדול מדי. הגודל המרבי הוא ${Math.round(ROSTER_MAX_BYTES / 1024 / 1024)}MB.`
             : 'העלאת הקובץ נכשלה.'
         return next(AppError.badRequest(message))
       }

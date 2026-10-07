@@ -1,12 +1,13 @@
 /**
  * Import an organisation's employee roster from the command line.
  *
- *   node scripts/import-org-roster.mjs --file roster.csv --org-id <uuid> [--dry-run]
+ *   node scripts/import-org-roster.mjs --file roster.xlsx --org-id <uuid> [--dry-run]
  *   node scripts/import-org-roster.mjs --file roster.csv --registry 511251217
  *
- * CSV columns (header row required):
+ * .xlsx or .csv, header row required - the same reader as the upload:
  *
- *   full_name,phone
+ *   שם, טלפון        required (full_name, phone also accepted)
+ *   מחלקה, תפקיד     optional (department, job_title)
  *
  * THERE IS NO ORGANISATION COLUMN. The organisation is named once, by flag,
  * because a name typed into a spreadsheet is the one thing that reliably
@@ -23,15 +24,16 @@
  *   --dry-run            parse and report, write nothing
  *   --out <path>         CSV of per-row outcomes
  *
- * WHAT IS STORED: only an HMAC of each phone number, plus the name. The
- * numbers are never written to the database and never printed here - output
- * is masked, because imports get run in shared terminals.
+ * WHAT IS STORED: an HMAC of each phone number (the matching key), the
+ * number itself in E.164 (since migration 015), the name, and the optional
+ * department and job title. Numbers are never printed here - output is
+ * masked, because imports get run in shared terminals.
  */
 import 'dotenv/config'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { query, withTransaction, pool } from '../db/pool.js'
 import { env } from '../config/env.js'
-import { applyRoster, planRoster, tally } from '../lib/rosterImport.js'
+import { applyRoster, planRoster, readRosterFile, tally } from '../lib/rosterImport.js'
 
 function parseArgs(argv) {
   const out = { dryRun: false }
@@ -52,7 +54,7 @@ const args = parseArgs(process.argv.slice(2))
 if (!args.file || (!args['org-id'] && !args.registry)) {
   console.error(
     'Usage:\n' +
-      '  node scripts/import-org-roster.mjs --file roster.csv --org-id <uuid> [--dry-run]\n' +
+      '  node scripts/import-org-roster.mjs --file roster.xlsx --org-id <uuid> [--dry-run]\n' +
       '  node scripts/import-org-roster.mjs --file roster.csv --registry <number>',
   )
   process.exit(1)
@@ -90,8 +92,8 @@ async function resolveOrganization() {
 
 async function main() {
   const org = await resolveOrganization()
-  const text = readFileSync(args.file, 'utf8')
-  const { planned, skipped, error } = planRoster(text, org.id)
+  const rows = await readRosterFile(readFileSync(args.file), args.file)
+  const { planned, skipped, error } = planRoster(rows, org.id)
 
   if (error) throw new Error(error)
 
@@ -102,7 +104,10 @@ async function main() {
   for (const s of skipped) console.log(`  SKIP  line ${s.line}  ${s.fullName ?? ''}  - ${s.reason}`)
 
   if (args.dryRun) {
-    for (const p of planned) console.log(`  PLAN  ${p.masked}  ${p.fullName ?? ''}`)
+    for (const p of planned) {
+      const extra = [p.department, p.jobTitle].filter(Boolean).join(' / ')
+      console.log(`  PLAN  ${p.masked}  ${p.fullName ?? ''}${extra ? `  (${extra})` : ''}`)
+    }
     console.log('\nDry run - nothing written.')
     return
   }

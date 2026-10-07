@@ -3,7 +3,7 @@ import { query, withTransaction } from '../db/pool.js'
 import { AppError } from '../lib/AppError.js'
 import { normalizePhone } from '../lib/phone.js'
 import { generateJoinCode, hashPhone, normalizeJoinCode } from '../lib/rosterHash.js'
-import { applyRoster, planRoster, tally } from '../lib/rosterImport.js'
+import { applyRoster, planRoster, readRosterFile, tally } from '../lib/rosterImport.js'
 import { maskPhone } from '../lib/rosterImport.js'
 import {
   activeProvider,
@@ -15,6 +15,7 @@ import {
   sendSms,
 } from '../lib/smsProvider.js'
 import { env } from '../config/env.js'
+import { inviteOrgRepresentative, inviteRedirectUrl } from '../lib/mailProvider.js'
 
 /**
  * Interest submitted through the public form. This creates no account and
@@ -376,8 +377,8 @@ export async function postRoster(req, res) {
   if (!req.file) throw AppError.badRequest('לא צורף קובץ.')
 
 
-  const text = req.file.buffer.toString('utf8')
-  const { planned, skipped, error } = planRoster(text, req.orgAdmin.organizationId)
+  const rows = await readRosterFile(req.file.buffer, req.file.originalname)
+  const { planned, skipped, error } = planRoster(rows, req.orgAdmin.organizationId)
 
   if (error) throw AppError.badRequest(error)
   if (!planned.length && !skipped.length) {
@@ -396,8 +397,8 @@ export async function postRoster(req, res) {
   res.status(201).json({
     // `masked` and `fullName` only - the plan's plaintext numbers never
     // leave the server.
-    results: results.map(({ line, fullName, masked, status, detail }) => ({
-      line, fullName, masked, status, detail,
+    results: results.map(({ line, fullName, department, jobTitle, masked, status, detail }) => ({
+      line, fullName, department, jobTitle, masked, status, detail,
     })),
     skipped,
     attached,
@@ -408,7 +409,7 @@ export async function postRoster(req, res) {
 /** The current roster, for the admin's own organisation. Names, never hashes. */
 export async function getRoster(req, res) {
   const { rows } = await query(
-    `select employee_name, added_at, (claimed_at is not null) as claimed
+    `select employee_name, department, job_title, added_at, (claimed_at is not null) as claimed
        from public.org_rosters
       where organization_id = $1
       order by claimed_at nulls last, employee_name`,
@@ -702,4 +703,126 @@ export async function putTemplate(req, res) {
   })
 
   res.json({ saved: true, template: rows[0].invite_sms_template, preview, ...segmentsFor(preview) })
+}
+
+/* ------------------------------------------- inviting an org representative */
+
+export const inviteRepresentativeSchema = z.object({
+  email: z.email('כתובת אימייל לא תקינה').trim().toLowerCase(),
+
+  // Only for the greeting in the invitation email. Optional: the template
+  // falls back to a plain "שלום" without it.
+  name: z
+    .string()
+    .trim()
+    .max(80, 'השם ארוך מדי')
+    .optional()
+    .transform((v) => v || undefined),
+
+  // A registry selection, not free text. registryId is what makes the
+  // organisation identifiable - a typed name is the one thing that has
+  // reliably failed to match a registry name (see migration 012).
+  organization: z.object(
+    {
+      name: z.string({ error: 'יש לבחור ארגון' }).trim().min(2, 'יש לבחור ארגון').max(150),
+      // The message is on the type as well as the pattern, so omitting the
+      // field reads the same as typing something that is not a registry
+      // number - from the form's point of view they are the same mistake.
+      registryId: z
+        .string({ error: 'יש לבחור ארגון מתוך המרשם' })
+        .trim()
+        .regex(/^\d{5,15}$/, 'יש לבחור ארגון מתוך המרשם'),
+      source: z.enum(['companies', 'nonprofits']).nullable().optional(),
+    },
+    { error: 'יש לבחור ארגון' },
+  ),
+})
+
+/**
+ * Invite someone to represent their organisation, from the admin UI.
+ *
+ * The same thing scripts/send-org-invites.mjs does, deliberately in the same
+ * order: send first, then grant the role using the id the mail provider
+ * returned. Never an id from the request - that is what stops an invitation
+ * being redirected onto an account somebody else names.
+ *
+ * It creates no organisation. The representative declares that on the
+ * onboarding form the invitation opens, and activation creates it from what
+ * they declared.
+ */
+export async function postInviteRepresentative(req, res) {
+  const { email, name, organization } = req.body
+
+  // An account that already holds the role has nothing to gain from an
+  // invitation, and re-inviting would mail a fresh password link for an
+  // account already in use.
+  const { rows: existing } = await query(
+    `select p.user_type
+       from auth.users u join public.profiles p on p.id = u.id
+      where lower(u.email) = $1`,
+    [email],
+  )
+  if (existing.length) {
+    throw AppError.conflict(
+      existing[0].user_type === 'org_admin'
+        ? 'הכתובת הזו כבר רשומה כנציג ארגון.'
+        : 'לכתובת הזו כבר קיים חשבון במערכת.',
+    )
+  }
+
+  // The organisation exists before the invitation goes out, so the form the
+  // representative opens already knows which organisation they are joining.
+  // Resolved on registry_id, which migration 012 made unique and normalised -
+  // inviting a second representative for the same company reuses the row
+  // rather than creating a near-duplicate under a slightly different name.
+  const { rows: found } = await query(
+    `select id, name from public.organizations
+      where registry_id = public.normalize_registry_id($1)`,
+    [organization.registryId],
+  )
+
+  let org = found[0]
+  if (!org) {
+    const { rows: created } = await query(
+      `insert into public.organizations (name, registry_id, registry_source)
+       values ($1, public.normalize_registry_id($2), $3)
+       returning id, name`,
+      [organization.name, organization.registryId, organization.source ?? null],
+    )
+    org = created[0]
+  }
+
+  // org.name, not organization.name: if the organisation already existed,
+  // the email should name it the way the database does.
+  const { provider, userId } = await inviteOrgRepresentative({
+    email,
+    name,
+    organizationName: org.name,
+  })
+
+  // Both writes with the service role, using the id the invitation produced.
+  // org_admins is what loadInviteContext reads to prefill the onboarding
+  // form, so without it the representative would be asked to name the
+  // organisation that was just chosen for them.
+  await withTransaction(async (client) => {
+    await client.query(
+      `update public.profiles set user_type = 'org_admin' where id = $1`,
+      [userId],
+    )
+    await client.query(
+      `insert into public.org_admins (user_id, organization_id, contact_email)
+       values ($1, $2, $3)
+       on conflict (user_id) do update
+          set organization_id = excluded.organization_id, updated_at = now()`,
+      [userId, org.id, email],
+    )
+  })
+
+  res.status(201).json({
+    sent: true,
+    provider,
+    email,
+    organization: { id: org.id, name: org.name },
+    opensAt: inviteRedirectUrl(),
+  })
 }

@@ -46,6 +46,21 @@ const schema = z.object({
   // else's phone rings. Empty means no restriction - production.
   SMS_ALLOWLIST: z.string().default(''),
 
+  // ---- Email ----
+  // 'supabase': Supabase Auth sends, using the dashboard's "Invite user"
+  // template - one global body, English unless someone edits it there.
+  // 'smtp': Supabase only mints the invite link; we render the Hebrew body
+  // in lib/emails/ and send it with nodemailer. See lib/mailProvider.js.
+  MAIL_PROVIDER: z.enum(['supabase', 'smtp', 'resend']).default('supabase'),
+  RESEND_API_KEY: z.string().default(''),
+  // "Equalmind <equalmind.app@gmail.com>". With Gmail SMTP it must be the
+  // authenticated account (or a verified alias) or Gmail rewrites it.
+  MAIL_FROM: z.string().default(''),
+  SMTP_HOST: z.string().default(''),
+  SMTP_PORT: z.coerce.number().int().positive().default(465),
+  SMTP_USER: z.string().default(''),
+  SMTP_PASS: z.string().default(''),
+
   SMS4FREE_KEY: z.string().default(''),
   SMS4FREE_USER: z.string().default(''),
   SMS4FREE_PASSWORD: z.string().default(''),

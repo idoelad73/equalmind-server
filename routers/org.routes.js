@@ -3,7 +3,8 @@ import { validate } from '../middlewares/validate.js'
 import { rateLimit } from '../middlewares/rateLimit.js'
 import { requireAuth } from '../middlewares/requireAuth.js'
 import { requireOrgAdmin } from '../middlewares/requireOrgAdmin.js'
-import { singleCsv } from '../middlewares/upload.js'
+import { requireSystemAdmin } from '../middlewares/requireSystemAdmin.js'
+import { singleRosterFile } from '../middlewares/upload.js'
 import {
   affiliationSchema,
   claimByPhoneSchema,
@@ -13,12 +14,14 @@ import {
   getRoster,
   getSmsOutbox,
   getTemplate,
+  inviteRepresentativeSchema,
   joinByCodeSchema,
   notifySchema,
   orgRequestSchema,
   postActivate,
   postClaimByPhone,
   postJoinByCode,
+  postInviteRepresentative,
   postOrgRequest,
   postRoster,
   postRosterNotify,
@@ -71,7 +74,7 @@ orgRouter.post('/join-code/rotate', requireAuth, requireOrgAdmin, postRotateJoin
 // requireOrgAdmin - the file carries no organisation, and the request is not
 // allowed to name one.
 orgRouter.get('/roster', requireAuth, requireOrgAdmin, getRoster)
-orgRouter.post('/roster', requireAuth, requireOrgAdmin, singleCsv('file'), postRoster)
+orgRouter.post('/roster', requireAuth, requireOrgAdmin, singleRosterFile('file'), postRoster)
 orgRouter.delete('/roster', requireAuth, requireOrgAdmin, deleteRoster)
 
 // Messaging the roster. Rate limited hard: this is the one endpoint that
@@ -98,4 +101,17 @@ orgRouter.put(
   requireOrgAdmin,
   validate({ body: templateSchema }),
   putTemplate,
+)
+
+// Equalmind staff inviting an organisation's representative. Rate limited:
+// each call creates an account and sends mail, and Supabase's own sender is
+// capped anyway - better to refuse here with a clear message than to be
+// throttled upstream halfway through.
+orgRouter.post(
+  '/invite-representative',
+  requireAuth,
+  requireSystemAdmin,
+  rateLimit({ windowMs: 60 * 60_000, max: 20 }),
+  validate({ body: inviteRepresentativeSchema }),
+  postInviteRepresentative,
 )
