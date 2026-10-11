@@ -146,14 +146,16 @@ async function main() {
   console.log(`auth user                    ${userId}`)
 
   // ---- 4. grant, with the service role, using the returned id ---------
+  // Name and mobile are not recorded here: the invitee types them on the
+  // onboarding form, which writes org_admin_details. Storing a second copy
+  // only created two answers to "who is this admin" - see migration 026.
   await query(
-    `insert into public.org_admins
-       (user_id, organization_id, full_name, mobile, contact_email)
-     values ($1, $2, $3, $4, $5)
+    `insert into public.org_admins (user_id, organization_id, contact_email)
+     values ($1, $2, $3)
      on conflict (user_id) do update
        set organization_id = excluded.organization_id,
            updated_at = now()`,
-    [userId, organization.id, args.name ?? null, args.mobile ?? null, email],
+    [userId, organization.id, email],
   )
 
   await query(`update public.profiles set user_type = 'org_admin' where id = $1`, [userId])

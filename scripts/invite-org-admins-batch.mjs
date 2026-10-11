@@ -206,13 +206,14 @@ async function inviteOne(row) {
 
   const userId = data.user.id
 
+  // Name and mobile come from the onboarding form, not from here - see
+  // migration 026. The CSV may still carry them; they are simply unused.
   await query(
-    `insert into public.org_admins
-       (user_id, organization_id, full_name, mobile, contact_email)
-     values ($1,$2,$3,$4,$5)
+    `insert into public.org_admins (user_id, organization_id, contact_email)
+     values ($1,$2,$3)
      on conflict (user_id) do update
        set organization_id = excluded.organization_id, updated_at = now()`,
-    [userId, org.id, row.fullName, row.mobile, row.email],
+    [userId, org.id, row.email],
   )
   await query(`update public.profiles set user_type = 'org_admin' where id = $1`, [userId])
 

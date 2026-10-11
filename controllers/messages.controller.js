@@ -1,8 +1,8 @@
-import { randomBytes } from 'node:crypto'
 import { z } from 'zod'
 import { query, withTransaction } from '../db/pool.js'
 import { AppError } from '../lib/AppError.js'
-import { categoryKeySchema } from './reports.controller.js'
+import { addToCatalogue, describeBehavior, resolveCategory } from '../lib/catalogue.js'
+import { categoryKeySchema, TARGET_TYPES } from './reports.controller.js'
 
 /**
  * The system admin's review queue.
@@ -23,19 +23,61 @@ export const decisionSchema = z.object({
 })
 
 /**
+ * Text a reviewer may blank out. `null` means "clear this field"; leaving
+ * the key out entirely means "do not touch it". Those are different
+ * instructions and the difference matters - a form that cannot express
+ * "remove what is there" quietly makes every field append-only.
+ */
+const clearableText = (max) =>
+  z
+    .string()
+    .trim()
+    .max(max)
+    .transform((v) => (v === '' ? null : v))
+    .nullable()
+    .optional()
+
+/**
  * Approving may correct what the reporter wrote before it joins the
- * catalogue. Every field is optional: left out, the reporter's own wording
- * and category are used.
+ * catalogue. Every field is optional: left out, the reporter's own version
+ * stands.
+ *
+ * `name` and the category decide the catalogue row. The rest edit the
+ * REPORT - somebody else's account of something that happened to them - so
+ * approveMessage records the old value of each one in messages.edits
+ * before overwriting it. See migration 029.
  */
 export const approveSchema = decisionSchema
   .extend({
     name: z.string().trim().min(3, 'הנוסח קצר מדי').max(200).optional(),
     categoryKey: categoryKeySchema.optional(),
     categoryLabel: z.string().trim().min(2, 'שם הקטגוריה קצר מדי').max(80).optional(),
+
+    // The report's own fields.
+    space: z.enum(['work', 'community', 'consumption']).optional(),
+    targetType: z.enum(TARGET_TYPES).optional(),
+    targetName: clearableText(120),
+    localityName: clearableText(120),
+    localityCode: z.string().trim().regex(/^\d{1,6}$/).nullable().optional(),
+    occurredAt: z.iso.datetime({ offset: true }).nullable().optional(),
+    occurredText: clearableText(120),
+    notes: clearableText(1000),
   })
   .refine((v) => !(v.categoryKey && v.categoryLabel), {
     message: 'יש לבחור קטגוריה קיימת או חדשה, לא את שתיהן',
     path: ['categoryKey'],
+  })
+  // Mirrors the reports_employee_has_name constraint, so a reviewer gets a
+  // sentence in Hebrew rather than a 500 from Postgres.
+  .refine((v) => v.targetType !== 'employee' || v.targetName !== null, {
+    message: 'Hook על עובד/ת חייב לכלול שם',
+    path: ['targetName'],
+  })
+  // Same rule the filing form follows: a CBS code with no name is half a
+  // locality, countable but not showable.
+  .refine((v) => !(v.localityCode && v.localityName === null), {
+    message: 'יש לציין את שם היישוב',
+    path: ['localityName'],
   })
 
 /**
@@ -55,9 +97,11 @@ export async function listMessages(req, res) {
 
   const { rows } = await query(
     `select m.message_id, m.user_name, m.new_hook_text, m.date, m.message_type,
-            m.status, m.handled_at, m.handling_note, m.behavior_id,
+            m.status, m.handled_at, m.handling_note, m.behavior_id, m.edits,
             r.space, r.target_type, r.target_name,
-            r.locality_name, r.occurred_at, r.occurred_text, r.notes,
+            -- locality_code comes along so the reviewer's picker can show
+            -- the stored locality as a selection rather than as bare text.
+            r.locality_name, r.locality_code, r.occurred_at, r.occurred_text, r.notes,
             r.category_key,
             -- What the reviewer reads: the existing category's current
             -- label, or the new one the reporter proposed.
@@ -130,7 +174,10 @@ export async function approveMessage(req, res) {
   const result = await withTransaction(async (client) => {
     const { rows } = await client.query(
       `select m.message_id, m.status, m.new_hook_text, m.report_id,
-              r.space, r.category_key, r.category_label
+              r.space, r.category_key, r.category_label,
+              r.behavior_name, r.target_type, r.target_name, r.target_worker_id,
+              r.locality_name, r.locality_code, r.occurred_at, r.occurred_text,
+              r.notes
          from public.messages m
          left join public.reports r on r.id = m.report_id
         where m.message_id = $1
@@ -150,7 +197,7 @@ export async function approveMessage(req, res) {
       throw AppError.badRequest('ה-Hook המקורי נמחק, ולכן לא ידוע לאיזה מרחב לשייך אותו.')
     }
 
-    const space = message.space
+    const space = body.space ?? message.space
     const name = body.name ?? message.new_hook_text
 
     // The reviewer's choice wins; otherwise whatever the reporter picked.
@@ -159,28 +206,13 @@ export async function approveMessage(req, res) {
       label: body.categoryKey ? null : (body.categoryLabel ?? message.category_label),
     })
 
-    const { rows: order } = await client.query(
-      `select coalesce(max(sort_order), 0) + 10 as next
-         from public.behaviors where space = $1 and category_key = $2`,
-      [space, category.key],
-    )
-
-    // Same wording already in the catalogue (the unique index is on
-    // space + lower(name)): reactivate it rather than fail. Its category is
-    // left alone - it was placed there deliberately by someone before.
-    const { rows: inserted } = await client.query(
-      `insert into public.behaviors
-         (space, category_key, category_label, category_order, name, sort_order)
-       values ($1, $2, $3, $4, $5, $6)
-       on conflict (space, lower(name)) do update set is_active = true
-       returning id, name, category_key, category_label, (xmax = 0) as created`,
-      [space, category.key, category.label, category.order, name, order[0].next],
-    )
-    const behavior = inserted[0]
+    const behavior = await addToCatalogue(client, { space, name, category })
 
     // The Hook now points at a real catalogue row, so it counts alongside
-    // every later report of the same behaviour. behavior_name keeps the
-    // reporter's original wording, as it does for every report.
+    // every later report of the same behaviour - and carries whatever the
+    // reviewer corrected. `edits` holds what each field used to say.
+    const edits = message.report_id ? await applyReviewEdits(client, message, body, name) : null
+
     if (message.report_id) {
       await client.query(
         `update public.reports set behavior_id = $1 where id = $2 and behavior_id is null`,
@@ -191,65 +223,97 @@ export async function approveMessage(req, res) {
     const { rows: handled } = await client.query(
       `update public.messages
           set status = 'approved', handled_at = now(), handled_by = $2,
-              handling_note = $3, behavior_id = $4
+              handling_note = $3, behavior_id = $4,
+              new_hook_text = $5, edits = $6
         where message_id = $1
-        returning message_id, status, handled_at`,
-      [message.message_id, req.user.id, body.note ?? null, behavior.id],
+        returning message_id, status, handled_at, edits`,
+      [
+        message.message_id,
+        req.user.id,
+        body.note ?? null,
+        behavior.id,
+        name,
+        edits ? JSON.stringify(edits) : null,
+      ],
     )
 
-    return {
-      ...handled[0],
-      behavior: {
-        id: behavior.id,
-        name: behavior.name,
-        categoryKey: behavior.category_key,
-        categoryLabel: behavior.category_label,
-        created: behavior.created,
-      },
-    }
+    return { ...handled[0], behavior: describeBehavior(behavior) }
   })
 
   res.json(result)
 }
 
 /**
- * Turn a category choice into the three columns a behaviors row needs.
+ * The report columns a reviewer may correct, and where each one's new
+ * value comes from in the request body.
  *
- * An existing key takes its label and order from the catalogue. A new label
- * reuses a category of the same name if one exists - two people proposing
- * "תחבורה" should land on one card, not two - and otherwise gets a fresh
- * slug and goes last.
+ * behavior_name is in here and `name` drives it: the wording the reviewer
+ * settled on is the wording the report should read, not the typo it was
+ * filed with. The original survives in `edits`, which is the whole reason
+ * that column exists.
  */
-async function resolveCategory(client, space, { key, label }) {
-  if (key) {
-    const { rows } = await client.query(
-      `select category_key as key, category_label as label, category_order as "order"
-         from public.behaviors where space = $1 and category_key = $2
-        limit 1`,
-      [space, key],
-    )
-    if (!rows.length) throw AppError.badRequest('הקטגוריה שנבחרה אינה קיימת במרחב הזה.')
-    return rows[0]
+const EDITABLE = [
+  ['behavior_name', (body, name) => name],
+  ['space', (body) => body.space],
+  ['target_type', (body) => body.targetType],
+  ['target_name', (body) => body.targetName],
+  ['locality_name', (body) => body.localityName],
+  ['locality_code', (body) => body.localityCode],
+  ['occurred_at', (body) => body.occurredAt],
+  ['occurred_text', (body) => body.occurredText],
+  ['notes', (body) => body.notes],
+]
+
+/** Two values are "the same" if both are empty or both read alike. */
+const same = (a, b) => {
+  if (a instanceof Date) return b !== null && b !== undefined && +a === +new Date(b)
+  return (a ?? null) === (b ?? null)
+}
+
+/**
+ * Apply the reviewer's corrections to the report, and return a record of
+ * what they replaced.
+ *
+ * Only columns the request actually named are considered, and of those,
+ * only the ones whose value really changed - so an approval that touched
+ * nothing writes nothing and leaves `edits` null.
+ *
+ * Changing who a Hook is about drops target_worker_id. That column links
+ * to a specific colleague; leaving it attached to a name the reviewer just
+ * replaced would point the Hook at the wrong person while reading right.
+ */
+async function applyReviewEdits(client, report, body, name) {
+  const edits = {}
+  const sets = []
+  const params = []
+
+  for (const [column, read] of EDITABLE) {
+    const next = read(body, name)
+    if (next === undefined) continue
+    if (same(report[column], next)) continue
+
+    edits[column] = {
+      from: report[column] instanceof Date ? report[column].toISOString() : (report[column] ?? null),
+      to: next,
+    }
+    params.push(next)
+    sets.push(`${column} = $${params.length}`)
   }
 
-  if (label) {
-    const { rows: same } = await client.query(
-      `select category_key as key, category_label as label, category_order as "order"
-         from public.behaviors where space = $1 and lower(category_label) = lower($2)
-        limit 1`,
-      [space, label],
-    )
-    if (same.length) return same[0]
+  if (!sets.length) return null
 
-    const { rows: last } = await client.query(
-      `select coalesce(max(category_order), 0) + 10 as next
-         from public.behaviors where space = $1`,
-      [space],
-    )
-    // The label is Hebrew, so it cannot become a readable slug. The key only
-    // has to be stable and unique; the client shows a generic icon for it.
-    return { key: `c_${randomBytes(4).toString('hex')}`, label, order: last[0].next }
+  if (edits.target_type || edits.target_name) {
+    sets.push('target_worker_id = null')
+    if (report.target_worker_id) {
+      edits.target_worker_id = { from: report.target_worker_id, to: null }
+    }
   }
 
-  throw AppError.badRequest('יש לבחור קטגוריה לפני האישור.')
+  params.push(report.report_id)
+  await client.query(
+    `update public.reports set ${sets.join(', ')} where id = $${params.length}`,
+    params,
+  )
+
+  return edits
 }

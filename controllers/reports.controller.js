@@ -2,6 +2,8 @@ import { z } from 'zod'
 import { query, withTransaction } from '../db/pool.js'
 import { AppError } from '../lib/AppError.js'
 import { getSignedUrl } from '../lib/mediaProvider.js'
+import { findWorker, workerAccessFor } from '../lib/workers.js'
+import { addToCatalogue, describeBehavior, resolveCategory } from '../lib/catalogue.js'
 
 const optionalText = (max) =>
   z
@@ -11,9 +13,20 @@ const optionalText = (max) =>
     .optional()
     .transform((v) => (v === '' ? undefined : v))
 
-/** Where and when - shared by catalogue and custom Hooks. */
+const localityName = z.string().trim().min(1, 'יש לבחור יישוב').max(120)
+
+/**
+ * Where and when - shared by catalogue and custom Hooks.
+ *
+ * The locality is OPTIONAL here, and the catalogue schema puts the
+ * requirement back on top. The two forms differ on purpose: the catalogue
+ * describes a known behaviour, where the place is most of what makes the
+ * report useful in aggregate; the custom form is where someone goes when
+ * nothing on the list fits, and stopping them over a field they may not be
+ * able to fill means the report never gets filed at all.
+ */
 const momentFields = {
-  localityName: z.string().trim().min(1, 'יש לבחור יישוב').max(120),
+  localityName: localityName.optional(),
   localityCode: z
     .string()
     .trim()
@@ -29,6 +42,8 @@ const momentFields = {
 export const createReportSchema = z.object({
   behaviorId: z.uuid('התנהגות לא תקינה'),
   ...momentFields,
+  // After the spread, so it overrides the optional one above.
+  localityName,
   photoPublicId: optionalText(200),
 })
 
@@ -42,30 +57,42 @@ export const createCustomReportSchema = z
     space: z.enum(['work', 'community', 'consumption']),
     description: z.string().trim().min(3, 'יש לתאר את ה-Hook').max(200),
 
-    // Exactly one: an existing category, or the name of a proposed one. A
-    // behaviors row cannot exist without a category, so the form asks now
-    // rather than leaving the reviewer to guess (migration 025).
+    // At most one: an existing category, or the name of a proposed one.
+    // Neither means the reporter chose "ללא קטגוריה" - the system admin
+    // then picks one at approval, since a behaviors row cannot exist
+    // without a category (migration 025, approveMessage).
     categoryKey: categoryKeySchema.optional(),
     categoryLabel: optionalText(80),
 
     targetType: z.enum(TARGET_TYPES, 'יש לבחור על מי ה-Hook'),
     targetName: optionalText(120),
+    // An employee picked from the colleagues list (org_workers.worker_id).
+    // The name is then looked up server-side, never taken from the client.
+    targetWorkerId: z.uuid('עובד/ת לא תקין/ה').optional(),
     ...momentFields,
   })
-  .refine((v) => Boolean(v.categoryKey) !== Boolean(v.categoryLabel), {
-    message: 'יש לבחור קטגוריה',
+  .refine((v) => !(v.categoryKey && v.categoryLabel), {
+    message: 'יש לבחור קטגוריה אחת',
     path: ['categoryKey'],
   })
-  .refine((v) => v.targetType !== 'employee' || v.targetName, {
-    message: 'יש להזין את שם העובד/ת',
+  // A CBS code with no name would store half a locality: a row that can be
+  // counted in aggregate but not shown to anyone. The form always sends
+  // both or neither; this stops anything else from reaching the column.
+  .refine((v) => !(v.localityCode && !v.localityName), {
+    message: 'יש לציין את שם היישוב',
+    path: ['localityName'],
+  })
+  .refine((v) => v.targetType !== 'employee' || v.targetWorkerId || v.targetName, {
+    message: 'יש לבחור עובד/ת מהרשימה או להקליד שם',
     path: ['targetName'],
   })
-  // A name means something only for the two targets that ask for one.
-  .transform((v) =>
-    v.targetType === 'employee' || v.targetType === 'business'
-      ? v
-      : { ...v, targetName: undefined },
-  )
+  // A name means something only for the two targets that ask for one, and a
+  // worker id only for an employee.
+  .transform((v) => ({
+    ...v,
+    targetName: v.targetType === 'employee' || v.targetType === 'business' ? v.targetName : undefined,
+    targetWorkerId: v.targetType === 'employee' ? v.targetWorkerId : undefined,
+  }))
 
 /**
  * Which organisation a report belongs to.
@@ -161,6 +188,31 @@ export async function createCustomReport(req, res) {
 
   const organizationId = await organizationForReporter(req.user.id)
 
+  // A system admin IS the approver, so their Hook skips the queue and joins
+  // the catalogue at once. Read from profiles, never from the request - the
+  // same rule as requireSystemAdmin.
+  const { rows: me } = await query(`select user_type from public.profiles where id = $1`, [
+    req.user.id,
+  ])
+  const direct = me[0]?.user_type === 'system_admin'
+  // A catalogue row cannot exist without a category, so "ללא קטגוריה" -
+  // which means "let the reviewer decide" - has no meaning here.
+  if (direct && !body.categoryKey && !body.categoryLabel) {
+    throw AppError.badRequest('ה-Hook נוסף ישירות לרשימה, ולכן יש לבחור קטגוריה או לתת שם לקטגוריה חדשה.')
+  }
+
+  // A picked colleague must be in the reporter's own organisation - the same
+  // scope the list or search was served from (workerAccessFor). The name
+  // stored is the list's, so a client cannot attach one person's id to
+  // another's name.
+  let targetName = body.targetName ?? null
+  if (body.targetWorkerId) {
+    const access = await workerAccessFor(req.user.id)
+    const worker = access && (await findWorker(access.organizationId, body.targetWorkerId))
+    if (!worker) throw AppError.badRequest('העובד/ת שנבחר/ה אינו/ה ברשימת הארגון שלך.')
+    targetName = worker.full_name
+  }
+
   // The report and its review message are written together. A Hook outside
   // the catalogue that reached the database without reaching the queue would
   // sit there unreviewed with nothing pointing at it, and nobody would know
@@ -169,18 +221,20 @@ export async function createCustomReport(req, res) {
     const { rows } = await client.query(
       `insert into public.reports
          (space, behavior_id, behavior_name, category_key, category_label,
-          target_type, target_name,
+          target_type, target_name, target_worker_id,
           locality_code, locality_name, occurred_at, occurred_text, notes,
           user_id, organization_id)
-       values ($1, null, $2, $12, $13, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       values ($1, null, $2, $12, $13, $3, $4, $14, $5, $6, $7, $8, $9, $10, $11)
        returning id, created_at`,
       [
         body.space,
         body.description,
         body.targetType,
-        body.targetName ?? null,
+        targetName,
         body.localityCode ?? null,
-        body.localityName,
+        // Null when the reporter did not name a place: optional on this
+        // form, and nullable on the column as of migration 028.
+        body.localityName ?? null,
         body.occurredAt ?? null,
         body.occurredText ?? null,
         body.notes ?? null,
@@ -188,6 +242,7 @@ export async function createCustomReport(req, res) {
         organizationId,
         body.categoryKey ?? null,
         body.categoryLabel ?? null,
+        body.targetWorkerId ?? null,
       ],
     )
 
@@ -203,19 +258,58 @@ export async function createCustomReport(req, res) {
       [req.user.id],
     )
 
+    // System admin: straight into the catalogue, through the same code an
+    // approval uses (lib/catalogue.js), and the report points at it.
+    let behavior = null
+    if (direct) {
+      const category = await resolveCategory(client, body.space, {
+        key: body.categoryKey ?? null,
+        label: body.categoryKey ? null : (body.categoryLabel ?? null),
+      })
+      behavior = await addToCatalogue(client, {
+        space: body.space,
+        name: body.description,
+        category,
+      })
+      await client.query(`update public.reports set behavior_id = $1 where id = $2`, [
+        behavior.id,
+        report.id,
+      ])
+    }
+
+    // Every custom Hook gets a message row. A system admin's is written
+    // already approved, by themselves: it never waits in the queue, but the
+    // "approved" tab still shows where every catalogue addition came from.
     await client.query(
       `insert into public.messages
-         (user_id, user_name, new_hook_text, message_type, report_id)
-       values ($1, $2, $3, 'new_hook', $4)
+         (user_id, user_name, new_hook_text, message_type, report_id,
+          status, handled_at, handled_by, handling_note, behavior_id)
+       values ($1, $2, $3, 'new_hook', $4,
+               $5, case when $5 = 'approved' then now() end,
+               case when $5 = 'approved' then $1::uuid end, $6, $7)
        on conflict (report_id) where report_id is not null
        do update set new_hook_text = excluded.new_hook_text, date = now()`,
-      [req.user.id, who[0]?.name ?? null, body.description, report.id],
+      [
+        req.user.id,
+        who[0]?.name ?? null,
+        body.description,
+        report.id,
+        direct ? 'approved' : 'pending',
+        direct ? 'נוסף ישירות על ידי מנהל/ת מערכת' : null,
+        behavior?.id ?? null,
+      ],
     )
 
-    return report
+    return { report, behavior }
   })
 
-  res.status(201).json({ filed: true, id: filed.id, createdAt: filed.created_at })
+  res.status(201).json({
+    filed: true,
+    id: filed.report.id,
+    createdAt: filed.report.created_at,
+    // Set only for a system admin: the Hook is already in the catalogue.
+    addedToCatalogue: filed.behavior ? describeBehavior(filed.behavior) : null,
+  })
 }
 
 /* ------------------------------------------------- the org admin's view */

@@ -385,9 +385,15 @@ export async function postRoster(req, res) {
     throw AppError.badRequest('לא נמצאו שורות בקובץ.')
   }
 
-  const { results, attached } = await withTransaction((client) =>
-    applyRoster(planned, (sql, params) => client.query(sql, params)),
-  )
+  // now() is the TRANSACTION timestamp, so every row this import inserts
+  // carries exactly this added_at. The invitation dialog hands it straight
+  // back as `since`, which is how "only the new ones" can mean the ones
+  // THIS upload added rather than the ones we happen not to have messaged.
+  const { results, attached, importedAt } = await withTransaction(async (client) => {
+    const run = (sql, params) => client.query(sql, params)
+    const { rows: [clock] } = await run('select now() as at')
+    return { ...(await applyRoster(planned, run)), importedAt: clock.at }
+  })
 
   // Importing never sends. Inviting is a separate, reviewed step through
   // POST /roster/notify - the client opens the invitation dialog after a
@@ -402,6 +408,7 @@ export async function postRoster(req, res) {
     })),
     skipped,
     attached,
+    importedAt,
     summary: tally(results),
   })
 }
@@ -451,6 +458,12 @@ export const notifySchema = z.object({
   // Message people already invited once. Off by default; a repeated
   // invitation is the complaint nobody forgives.
   resend: z.boolean().default(false),
+  // The timestamp of the import this dialog was opened from, when there was
+  // one. It narrows "new" to the rows that import actually added. Without
+  // it, "new" falls back to "never invited" - which is the only thing the
+  // word can mean on a dialog opened from the dashboard with no upload
+  // behind it.
+  since: z.iso.datetime().optional(),
 })
 
 /**
@@ -497,8 +510,31 @@ async function invitationFor(organizationId) {
  * Each message is written to sms_outbox BEFORE it is attempted, so a process
  * that dies mid-run still leaves evidence of what it tried.
  */
-async function sendInvitations({ organizationId, userId, limit, resend }) {
+/**
+ * Which roster rows an audience covers, as a SQL fragment.
+ *
+ * Everyone considered here is already narrowed to "on this roster, has not
+ * registered, has a stored number". This decides only the extra filter:
+ *
+ *   all    no filter. Everyone who has not registered yet.
+ *   new    the rows THIS import added, when the dialog came from an upload
+ *          and handed back its timestamp; otherwise the rows nobody has
+ *          ever been invited from.
+ *
+ * One definition, used by the count beside each option, by the dry run and
+ * by the real send. Three copies of this predicate would be three chances
+ * for the button to promise a number the send does not keep - and that is
+ * exactly the bug this replaces.
+ */
+function audienceClause({ resend, since }, paramIndex) {
+  if (resend) return { sql: '', params: [] }
+  if (since) return { sql: `and added_at >= $${paramIndex}`, params: [since] }
+  return { sql: 'and invited_at is null', params: [] }
+}
+
+async function sendInvitations({ organizationId, userId, limit, resend, since }) {
   const { body, cost } = await invitationFor(organizationId)
+  const audience = audienceClause({ resend, since }, 2)
 
   const { rows: targets } = await query(
     `select id, phone, employee_name
@@ -506,10 +542,10 @@ async function sendInvitations({ organizationId, userId, limit, resend }) {
       where organization_id = $1
         and claimed_at is null
         and phone is not null
-        ${resend ? '' : 'and invited_at is null'}
+        ${audience.sql}
       order by employee_name
-      limit $2`,
-    [organizationId, limit],
+      limit $${2 + audience.params.length}`,
+    [organizationId, ...audience.params, limit],
   )
 
   const results = []
@@ -572,7 +608,7 @@ async function sendInvitations({ organizationId, userId, limit, resend }) {
 }
 
 export async function postRosterNotify(req, res) {
-  const { dryRun, limit, resend } = req.body
+  const { dryRun, limit, resend, since } = req.body
   const { body, cost } = await invitationFor(req.orgAdmin.organizationId)
 
   // Rows with no stored number cannot be reached: a hash is not reversible.
@@ -584,13 +620,31 @@ export async function postRosterNotify(req, res) {
   )
 
   if (dryRun) {
+    const audience = audienceClause({ resend, since }, 2)
     const { rows: targets } = await query(
       `select phone, employee_name from public.org_rosters
         where organization_id = $1 and claimed_at is null and phone is not null
-          ${resend ? '' : 'and invited_at is null'}
-        order by employee_name limit $2`,
-      [req.orgAdmin.organizationId, limit],
+          ${audience.sql}
+        order by employee_name limit $${2 + audience.params.length}`,
+      [req.orgAdmin.organizationId, ...audience.params, limit],
     )
+
+    // Both figures, not just the chosen one, so the dialog can label each
+    // option with what it would cost. Choosing between "everyone" and "only
+    // the new ones" without those numbers is guesswork, and the difference
+    // is messages that reach people twice.
+    //
+    // The "new" figure is built from the SAME clause the send would use, so
+    // the number beside the option is the number of messages it sends.
+    const narrowed = audienceClause({ resend: false, since }, 2)
+    const { rows: [counts] } = await query(
+      `select count(*) filter (where true ${narrowed.sql})::int as new_only,
+              count(*)::int as all_unclaimed
+         from public.org_rosters
+        where organization_id = $1 and claimed_at is null and phone is not null`,
+      [req.orgAdmin.organizationId, ...narrowed.params],
+    )
+
     return res.json({
       provider: activeProvider(),
       allowlist: allowlistActive(),
@@ -599,6 +653,10 @@ export async function postRosterNotify(req, res) {
       segments: cost.segments,
       unicode: cost.unicode,
       recipients: targets.length,
+      counts: { newOnly: counts.new_only, all: counts.all_unclaimed },
+      // How many one send covers. The counts above are uncapped, so without
+      // this the dialog cannot tell "2 people" from "2 people, 50 at a time".
+      limit,
       unreachable,
       totalSegments: cost.segments * targets.length,
       results: targets.map((t) => ({
@@ -614,6 +672,7 @@ export async function postRosterNotify(req, res) {
     userId: req.user.id,
     limit,
     resend,
+    since,
   })
 
   res.json({
@@ -825,4 +884,27 @@ export async function postInviteRepresentative(req, res) {
     organization: { id: org.id, name: org.name },
     opensAt: inviteRedirectUrl(),
   })
+}
+
+/* ---------------------------------------------- organisations, for staff */
+
+/**
+ * Every organisation, for the staff organisation picker.
+ *
+ * Behind requireSystemAdmin: an org admin has exactly one organisation and
+ * has no business enumerating the others. The roster counts come along so
+ * the picker can show what it is about to add to.
+ */
+export async function listOrganizations(_req, res) {
+  const { rows } = await query(
+    `select o.id, o.name, o.registry_id,
+            (select count(*)::int from public.org_rosters r
+              where r.organization_id = o.id) as roster_count,
+            (select count(*)::int from public.profiles p
+              where p.organization_id = o.id) as attached
+       from public.organizations o
+      where o.is_active
+      order by o.name`,
+  )
+  res.json({ count: rows.length, organizations: rows })
 }
