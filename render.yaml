@@ -1,0 +1,110 @@
+# Render Blueprint - Equalmind API (this repository).
+#
+# The client lives in a DIFFERENT repository (equalmind-client) and has its
+# own render.yaml. A Blueprint is read from the root of one repo, so the
+# two cannot be described together. The client reaches this service
+# through a rewrite declared over there, not through CORS.
+#
+# A Blueprint does not apply itself: connect this repository as a Blueprint
+# for Render to read it. Nothing here changes a service created from the
+# dashboard.
+#
+# BEFORE SYNCING, check every CONFIRM below. name, region, plan and branch
+# are account facts this file cannot know; a name that does not match the
+# existing service makes Render create a SECOND one beside it.
+#
+# NO SECRET IS IN THIS FILE. Every key is a safe constant or `sync: false`,
+# which tells Render "this one is set in the dashboard, leave it alone".
+
+services:
+  - type: web
+    runtime: node
+    name: equalmind-server          # CONFIRM: must match the existing service
+    region: frankfurt               # CONFIRM: same region as the client, or
+                                    # every API call crosses a continent
+    plan: free                      # CONFIRM
+    branch: develop                 # CONFIRM: the branch Render deploys
+    buildCommand: npm ci
+    startCommand: npm start
+    # Express 5 + ESM throughout. Pinned because a silent major bump is a
+    # boot failure in a service nobody is watching.
+    nodeVersion: 22
+    # Already mounted under /api/health. A free instance sleeps when idle;
+    # this is what wakes it and what tells Render a deploy came up.
+    healthCheckPath: /api/health
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Render sets PORT itself and the app reads it (config/env.js
+      # defaults to 4000 only for local work). Do not pin it here.
+
+      # CORS, and the base for invite links - lib/mailProvider.js builds
+      # them from clientOrigins[0], so THE DEPLOYED URL MUST COME FIRST.
+      # Leaving localhost first mails out links that work on one laptop.
+      - key: CLIENT_ORIGIN
+        sync: false
+
+      # ---- Supabase ----
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      # Bypasses row-level security. Server-side only, never a VITE_ key.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Session pooler, port 5432. The direct connection is IPv6-only and
+      # Render cannot reach it.
+      - key: DATABASE_URL
+        sync: false
+
+      # CANNOT BE ROTATED. There is no plaintext to re-hash from, so a new
+      # value orphans every unclaimed roster row. Back it up with the
+      # database, not only here.
+      - key: ROSTER_HASH_SECRET
+        sync: false
+
+      # ---- SMS ----
+      - key: SMS_PROVIDER
+        sync: false
+      - key: SMS_SENDER
+        sync: false
+      # Where an invited employee lands. Still a LAN address in the local
+      # .env, which reaches nobody from Render.
+      - key: SMS_INVITE_URL
+        sync: false
+      # The safety rail: while it holds numbers, nothing is sent to anyone
+      # else. Clearing it reaches the whole roster, so clear it on purpose.
+      - key: SMS_ALLOWLIST
+        sync: false
+
+      # ---- Mail ----
+      - key: MAIL_PROVIDER
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+
+      # ---- Cloudinary ----
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        sync: false
+      # Unset means signed photo links never expire. getSignedUrl reports
+      # expiresInSeconds: null when that is the case - it is not a default
+      # to leave alone quietly.
+      - key: CLOUDINARY_AUTH_TOKEN_KEY
+        sync: false
