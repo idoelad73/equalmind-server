@@ -115,16 +115,23 @@ orgRouter.post(
   postRosterNotify,
 )
 
-orgRouter.get('/sms', requireAuth, requireOrgAdmin, getSmsOutbox)
+// The delivery log for one organisation. requireOrgScope for the same
+// reason as the roster routes: staff who send on an organisation's behalf
+// have to be able to read what happened.
+orgRouter.get('/sms', requireAuth, requireOrgScope, getSmsOutbox)
 
-// The invitation text. Read and written by the organisation's own admin;
-// the length cap is enforced here and again by a check constraint, because
-// an over-long template costs money on every recipient.
-orgRouter.get('/template', requireAuth, requireOrgAdmin, getTemplate)
+// The invitation text. The length cap is enforced here and again by a check
+// constraint, because an over-long template costs money on every recipient.
+//
+// requireOrgScope, not requireOrgAdmin. The invitation dialog reads this
+// the moment it opens, so leaving it stricter than /roster/notify meant
+// staff could plan and send a batch while the dialog 403'd on the one
+// thing it exists to show them: the wording that is about to go out.
+orgRouter.get('/template', requireAuth, requireOrgScope, getTemplate)
 orgRouter.put(
   '/template',
   requireAuth,
-  requireOrgAdmin,
+  requireOrgScope,
   validate({ body: templateSchema }),
   putTemplate,
 )
