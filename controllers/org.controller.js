@@ -14,6 +14,7 @@ import {
   segmentsFor,
   sendSms,
 } from '../lib/smsProvider.js'
+import { optedOutHashes, optOutUrlFor, SAMPLE_OPT_OUT_TOKEN } from '../lib/optOut.js'
 import { env } from '../config/env.js'
 import { inviteOrgRepresentative, inviteRedirectUrl } from '../lib/mailProvider.js'
 
@@ -491,13 +492,31 @@ async function invitationFor(organizationId) {
   )
   if (!rows.length) throw AppError.notFound('הארגון לא נמצא.')
 
-  const body = MESSAGES.rosterInvite({
+  // Each recipient's message carries their own opt-out token, so there is
+  // no single body for a batch. What there IS is a single length: the
+  // sample token is exactly as long as a real one, so the segment count
+  // here is the one the gateway will bill for every recipient.
+  const sample = MESSAGES.rosterInvite({
     organizationName: rows[0].name,
     url: env.SMS_INVITE_URL,
+    optOutUrl: optOutUrlFor(SAMPLE_OPT_OUT_TOKEN),
     template: rows[0].invite_sms_template,
   })
 
-  return { organizationName: rows[0].name, body, cost: segmentsFor(body) }
+  const bodyFor = (optOutToken) =>
+    MESSAGES.rosterInvite({
+      organizationName: rows[0].name,
+      url: env.SMS_INVITE_URL,
+      optOutUrl: optOutUrlFor(optOutToken),
+      template: rows[0].invite_sms_template,
+    })
+
+  return {
+    organizationName: rows[0].name,
+    body: sample,
+    bodyFor,
+    cost: segmentsFor(sample),
+  }
 }
 
 /**
@@ -526,6 +545,25 @@ async function invitationFor(organizationId) {
  * for the button to promise a number the send does not keep - and that is
  * exactly the bug this replaces.
  */
+/**
+ * Everyone a send may reach, before the audience narrows it further.
+ *
+ * NOT CLAIMED - they already registered, so an invitation is noise.
+ * HAS A PHONE - a hash is not reversible, so there is nothing to dial.
+ * NOT OPTED OUT - they asked us to stop, and honouring that is the whole
+ * point of the link in the message. It lives in the shared predicate
+ * rather than at the send site so that the count beside each option, the
+ * dry run and the real send cannot disagree about it. A suppression check
+ * the preview does not know about would quietly promise messages that are
+ * never sent - or worse, be forgotten on one path.
+ */
+const SENDABLE = `
+        and claimed_at is null
+        and phone is not null
+        and not exists (
+          select 1 from public.sms_opt_outs s where s.phone_hash = org_rosters.phone_hash
+        )`
+
 function audienceClause({ resend, since }, paramIndex) {
   if (resend) return { sql: '', params: [] }
   if (since) return { sql: `and added_at >= $${paramIndex}`, params: [since] }
@@ -533,15 +571,14 @@ function audienceClause({ resend, since }, paramIndex) {
 }
 
 async function sendInvitations({ organizationId, userId, limit, resend, since }) {
-  const { body, cost } = await invitationFor(organizationId)
+  const { bodyFor, body: sample, cost } = await invitationFor(organizationId)
   const audience = audienceClause({ resend, since }, 2)
 
   const { rows: targets } = await query(
-    `select id, phone, employee_name
+    `select id, phone, employee_name, opt_out_token
        from public.org_rosters
       where organization_id = $1
-        and claimed_at is null
-        and phone is not null
+        ${SENDABLE}
         ${audience.sql}
       order by employee_name
       limit $${2 + audience.params.length}`,
@@ -560,11 +597,14 @@ async function sendInvitations({ organizationId, userId, limit, resend, since })
           set provider = excluded.provider, body = excluded.body,
               status = 'queued', error = null, created_at = now()
        returning id`,
-      [activeProvider(), target.phone, body, organizationId, target.id, userId],
+      [activeProvider(), target.phone, bodyFor(target.opt_out_token), organizationId, target.id, userId],
     )
 
     try {
-      const { provider, ref, skipped, reason } = await sendSms({ to: target.phone, body })
+      const { provider, ref, skipped, reason } = await sendSms({
+        to: target.phone,
+        body: bodyFor(target.opt_out_token),
+      })
 
       if (skipped) {
         // The allowlist declined it. Not a failure, and deliberately NOT
@@ -604,7 +644,10 @@ async function sendInvitations({ organizationId, userId, limit, resend, since })
     }
   }
 
-  return { body, cost, results, summary: tally(results) }
+  // No single body: each recipient's carries their own opt-out token.
+  // `sample` is what the dialog showed, kept so the response can echo
+  // back the wording that was approved.
+  return { sample, cost, results, summary: tally(results) }
 }
 
 export async function postRosterNotify(req, res) {
@@ -619,11 +662,23 @@ export async function postRosterNotify(req, res) {
     [req.orgAdmin.organizationId],
   )
 
+  // Reported separately from `unreachable`, because the two mean opposite
+  // things to whoever is reading the dialog: one is data we are missing,
+  // the other is an answer we were given.
+  const { rows: [{ opted_out: optedOut }] } = await query(
+    `select count(*)::int as opted_out
+       from public.org_rosters r
+       join public.sms_opt_outs s on s.phone_hash = r.phone_hash
+      where r.organization_id = $1 and r.claimed_at is null`,
+    [req.orgAdmin.organizationId],
+  )
+
   if (dryRun) {
     const audience = audienceClause({ resend, since }, 2)
     const { rows: targets } = await query(
       `select phone, employee_name from public.org_rosters
-        where organization_id = $1 and claimed_at is null and phone is not null
+        where organization_id = $1
+          ${SENDABLE}
           ${audience.sql}
         order by employee_name limit $${2 + audience.params.length}`,
       [req.orgAdmin.organizationId, ...audience.params, limit],
@@ -641,7 +696,7 @@ export async function postRosterNotify(req, res) {
       `select count(*) filter (where true ${narrowed.sql})::int as new_only,
               count(*)::int as all_unclaimed
          from public.org_rosters
-        where organization_id = $1 and claimed_at is null and phone is not null`,
+        where organization_id = $1 ${SENDABLE}`,
       [req.orgAdmin.organizationId, ...narrowed.params],
     )
 
@@ -654,6 +709,7 @@ export async function postRosterNotify(req, res) {
       unicode: cost.unicode,
       recipients: targets.length,
       counts: { newOnly: counts.new_only, all: counts.all_unclaimed },
+      optedOut,
       // How many one send covers. The counts above are uncapped, so without
       // this the dialog cannot tell "2 people" from "2 people, 50 at a time".
       limit,
@@ -679,11 +735,12 @@ export async function postRosterNotify(req, res) {
     provider: activeProvider(),
     allowlist: allowlistActive(),
     dryRun: false,
-    body: sent.body,
+    body: sent.sample,
     segments: sent.cost.segments,
     unicode: sent.cost.unicode,
     recipients: sent.results.length,
     unreachable,
+    optedOut,
     totalSegments: sent.cost.segments * sent.results.length,
     results: sent.results,
     summary: sent.summary,
@@ -728,6 +785,7 @@ export async function getTemplate(req, res) {
   const preview = MESSAGES.rosterInvite({
     organizationName: rows[0].name,
     url: env.SMS_INVITE_URL,
+    optOutUrl: optOutUrlFor(SAMPLE_OPT_OUT_TOKEN),
     template,
   })
 
@@ -736,6 +794,13 @@ export async function getTemplate(req, res) {
     template,
     defaultTemplate: DEFAULT_INVITE_TEMPLATE,
     maxLength: 280,
+    // The real link, so the counter in the editor measures the message
+    // rather than the template. {url} is five characters and the URL is
+    // about forty-five: the difference is a whole segment, per recipient.
+    inviteUrl: env.SMS_INVITE_URL,
+    // Sample, not real: every recipient gets their own token. Only the
+    // LENGTH is true, and length is what the counter needs.
+    optOutUrlSample: optOutUrlFor(SAMPLE_OPT_OUT_TOKEN),
     // The preview is what would actually be sent, with placeholders filled,
     // so the segment count is the real one rather than an estimate from the
     // unrendered template.
