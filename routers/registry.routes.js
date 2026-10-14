@@ -7,10 +7,13 @@ import {
   getCompanyById,
   getLocalities,
   getLocalityByCoords,
+  getPlaces,
   localityCoordsSchema,
   localitySearchSchema,
   lookupSchema,
+  placeSearchSchema,
 } from '../controllers/registry.controller.js'
+import { requireAuth } from '../middlewares/requireAuth.js'
 
 export const registryRouter = Router()
 
@@ -27,3 +30,8 @@ registryRouter.get(
   validate({ query: localityCoordsSchema }),
   getLocalityByCoords,
 )
+
+// Signed-in only, unlike the rest of this router: it proxies a free
+// third-party service, and an open proxy to it is one nobody else should be
+// able to run up on our behalf.
+registryRouter.get('/places', requireAuth, validate({ query: placeSearchSchema }), getPlaces)

@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { findOrganizationById, searchOrganizations } from '../lib/registryApi.js'
 import { localityFromCoords, searchLocalities } from '../lib/localitiesApi.js'
+import { searchPlaces } from '../lib/placesApi.js'
 
 export const lookupSchema = z.object({
   q: z.string().trim().min(2, 'נדרשים לפחות 2 תווים').max(80),
@@ -58,6 +59,31 @@ export async function getLocalities(req, res) {
     cached: Boolean(cached),
     results,
   })
+}
+
+/* ----------------------------------------------------------------- places */
+
+export const placeSearchSchema = z
+  .object({
+    q: z.string().trim().min(2, 'נדרשים לפחות 2 תווים').max(80),
+    // Both or neither. placesApi rounds them to ~1km before they go anywhere.
+    lat: z.coerce.number().min(29).max(34).optional(),
+    lon: z.coerce.number().min(34).max(36).optional(),
+  })
+  .refine((v) => (v.lat === undefined) === (v.lon === undefined), {
+    message: 'יש לשלוח קו רוחב וקו אורך יחד',
+    path: ['lat'],
+  })
+
+/**
+ * Business search for the consumption form. Same degraded contract as the
+ * registry: an outage returns an empty list the form can type past, never
+ * an error that reads as "this business does not exist".
+ */
+export async function getPlaces(req, res) {
+  const { q, lat, lon } = req.validatedQuery
+  const { results, degraded } = await searchPlaces(q, { lat, lon })
+  res.json({ query: q, count: results.length, degraded, results })
 }
 
 /**

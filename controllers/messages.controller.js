@@ -55,7 +55,11 @@ export const approveSchema = decisionSchema
 
     // The report's own fields.
     space: z.enum(['work', 'community', 'consumption']).optional(),
-    targetType: z.enum(TARGET_TYPES).optional(),
+    // Nullable like the clearable text beside it: absent means "leave
+    // it", null means "this Hook is about nobody in particular".
+    // Without null a reviewer could change a target but never remove
+    // one, and applyReviewEdits already understands the difference.
+    targetType: z.enum(TARGET_TYPES).nullable().optional(),
     targetName: clearableText(120),
     localityName: clearableText(120),
     localityCode: z.string().trim().regex(/^\d{1,6}$/).nullable().optional(),
@@ -85,9 +89,52 @@ export const approveSchema = decisionSchema
  * polling the full queue to count it would ship the queue to every client
  * on a timer.
  */
+/**
+ * THE QUEUE IS NOT A TABLE.
+ *
+ * It is public.reports, filtered by reports.review_status - a column that
+ * defaults to 'pending', so nothing has to remember to enqueue a new Hook.
+ * A separate queue table would have to be written at the moment a Hook is
+ * filed, and a second write at the same moment can fail, be retried or be
+ * skipped - and then the queue and the reports disagree with nobody to
+ * notice.
+ *
+ * public.messages holds the DECISION, not the arrival: who acted, when,
+ * with what note, and what they corrected. It is written in the same
+ * transaction as the status, so the two cannot drift.
+ *
+ *   behavior_id is null   the Hook proposes wording not in the catalogue.
+ *                         Approving it adds a behaviors row.
+ *   behavior_id is set    the behaviour is already in the catalogue.
+ *                         Approving it means "I have read this".
+ *
+ * That distinction is read from the report, not stored anywhere, so it
+ * cannot go stale either.
+ */
+const QUEUE_FROM = `
+    from public.reports r
+    left join public.messages m on m.report_id = r.id
+    left join public.profiles p on p.id = r.user_id
+    left join public.organizations o on o.id = r.organization_id`
+
+/**
+ * The state lives on the report (migration 035), so it is read, not
+ * computed. messages is still joined for the DECISION behind it - who
+ * acted, when, and what they corrected - which is an audit trail rather
+ * than a status.
+ */
+const STATUS = 'r.review_status'
+
+/**
+ * How many Hooks are waiting. Its own endpoint because the navbar polls
+ * it, and polling the whole queue to count it would ship the queue to
+ * every client on a timer.
+ */
 export async function getUnreadCount(req, res) {
   const { rows } = await query(
-    `select count(*)::int as pending from public.messages where status = 'pending'`,
+    `select count(*)::int as pending
+       ${QUEUE_FROM}
+      where ${STATUS} = 'pending'`,
   )
   res.json({ pending: rows[0].pending })
 }
@@ -96,13 +143,17 @@ export async function listMessages(req, res) {
   const { status, limit } = req.validatedQuery
 
   const { rows } = await query(
-    `select m.message_id, m.user_name, m.new_hook_text, m.date, m.message_type,
-            m.status, m.handled_at, m.handling_note, m.behavior_id, m.edits,
-            r.space, r.target_type, r.target_name,
-            -- locality_code comes along so the reviewer's picker can show
-            -- the stored locality as a selection rather than as bare text.
-            r.locality_name, r.locality_code, r.occurred_at, r.occurred_text, r.notes,
+    `select r.id,
+            r.space, r.behavior_id, r.behavior_name as new_hook_text,
             r.category_key,
+            r.target_type, r.target_name,
+            r.locality_name, r.occurred_at, r.occurred_text, r.notes,
+            r.created_at as date,
+            -- The reporter's name is read live rather than snapshotted: a
+            -- queue derived from reports has no moment at which to take a
+            -- copy. A deleted account simply shows no name.
+            p.full_name as user_name,
+            o.name as organization_name,
             -- What the reviewer reads: the existing category's current
             -- label, or the new one the reporter proposed.
             coalesce(
@@ -111,11 +162,15 @@ export async function listMessages(req, res) {
                 limit 1),
               r.category_label
             ) as category_label,
-            (r.category_key is null and r.category_label is not null) as category_is_new
-       from public.messages m
-       left join public.reports r on r.id = m.report_id
-      where ($1 = 'all' or m.status = $1)
-      order by m.date desc
+            (r.category_key is null and r.category_label is not null) as category_is_new,
+            -- Null behavior_id means the wording is not in the catalogue,
+            -- so approving it has to put it there. Set means it already is.
+            (r.behavior_id is null) as needs_catalogue,
+            ${STATUS} as status,
+            m.handled_at, m.handling_note, m.edits
+       ${QUEUE_FROM}
+      where ($1 = 'all' or ${STATUS} = $1)
+      order by r.created_at desc
       limit $2`,
     [status, limit],
   )
@@ -126,118 +181,157 @@ export async function listMessages(req, res) {
   res.json({ status, count: rows.length, messages: rows })
 }
 
-/** Deny one proposal. The Hook itself still counts - see migration 024. */
-async function decide(req, res, status) {
-  const { rows } = await query(
-    `update public.messages
-        set status = $2,
-            handled_at = now(),
-            handled_by = $3,
-            handling_note = $4
-      where message_id = $1 and status = 'pending'
-      returning message_id, status, handled_at`,
-    [req.params.id, status, req.user.id, req.body.note ?? null],
+/**
+ * Load the Hook under review and lock it.
+ *
+ * FOR UPDATE on the REPORT, not on a queue row - there may be no queue row
+ * yet. Two reviewers acting at once then serialise here, and the second
+ * one sees the decision the first just wrote.
+ */
+async function lockForReview(client, reportId) {
+  const { rows } = await client.query(
+    `select r.id as report_id, r.space, r.behavior_id, r.behavior_name,
+            r.category_key, r.category_label,
+            r.target_type, r.target_name, r.target_worker_id,
+            r.locality_name, r.locality_code, r.occurred_at, r.occurred_text,
+            r.notes, r.user_id,
+            p.full_name as user_name,
+            r.review_status as status,
+            m.message_id
+       from public.reports r
+       left join public.messages m on m.report_id = r.id
+       left join public.profiles p on p.id = r.user_id
+      where r.id = $1
+      for update of r`,
+    [reportId],
   )
 
-  if (!rows.length) {
-    // Either it does not exist or somebody already decided it. Saying
-    // "already handled" is more useful than a bare 404, and two reviewers
-    // clicking at once is the normal way this happens.
-    const { rows: existing } = await query(
-      'select status from public.messages where message_id = $1',
-      [req.params.id],
-    )
-    if (!existing.length) throw AppError.notFound('ההודעה לא נמצאה.')
-    throw AppError.conflict(`ההודעה כבר טופלה (${existing[0].status}).`)
+  const row = rows[0]
+  if (!row) throw AppError.notFound('ה-Hook לא נמצא.')
+  if (row.status !== 'pending') {
+    // Saying "already handled" is more useful than a bare 404, and two
+    // reviewers clicking at once is the normal way this happens.
+    throw AppError.conflict(`ה-Hook כבר טופל (${row.status}).`)
   }
-
-  res.json(rows[0])
+  return row
 }
 
-export const denyMessage = (req, res) => decide(req, res, 'denied')
+/**
+ * Write the decision.
+ *
+ * ON CONFLICT on messages_report_key - the partial unique index on
+ * report_id - so a decision is upserted rather than duplicated, however
+ * many times this path runs for one Hook.
+ */
+async function recordDecision(client, { report, status, userId, note, name, behaviorId, edits }) {
+  // The status and its decision, in one transaction. Either both land or
+  // neither does - which is the whole reason the status is not kept in a
+  // second table that something has to remember to update.
+  await client.query(
+    'update public.reports set review_status = $2 where id = $1',
+    [report.report_id, status],
+  )
+
+  const { rows } = await client.query(
+    `insert into public.messages
+       (user_id, user_name, new_hook_text, message_type, report_id,
+        status, handled_at, handled_by, handling_note, behavior_id, edits)
+     values ($1, $2, $3, $4, $5, $6, now(), $7, $8, $9, $10)
+     on conflict (report_id) where report_id is not null do update
+        set status = excluded.status,
+            handled_at = excluded.handled_at,
+            handled_by = excluded.handled_by,
+            handling_note = excluded.handling_note,
+            behavior_id = coalesce(excluded.behavior_id, public.messages.behavior_id),
+            new_hook_text = excluded.new_hook_text,
+            edits = excluded.edits
+     returning message_id, status, handled_at, edits`,
+    [
+      report.user_id,
+      report.user_name,
+      name,
+      // 'new_hook' only when it really proposed one - see migration 034.
+      report.behavior_id ? 'report' : 'new_hook',
+      report.report_id,
+      status,
+      userId,
+      note ?? null,
+      behaviorId ?? null,
+      edits ? JSON.stringify(edits) : null,
+    ],
+  )
+  return rows[0]
+}
+
+/** Reject one Hook. The report itself stands - see migration 024. */
+export async function denyMessage(req, res) {
+  const result = await withTransaction(async (client) => {
+    const report = await lockForReview(client, req.params.id)
+    return recordDecision(client, {
+      report,
+      status: 'denied',
+      userId: req.user.id,
+      note: req.body.note,
+      name: report.behavior_name,
+    })
+  })
+
+  res.json(result)
+}
 
 /**
- * Approve a proposal: the wording joins public.behaviors, so the next
- * person filing in that space can simply pick it.
+ * Approve one Hook.
  *
- * One transaction for all three writes - the behaviour, the report's link
- * to it, and the message's status. An approved message with no behaviour
- * behind it would read as done while nothing changed in the wizard.
+ * What that means depends on the Hook, and the report decides:
  *
- * The message row is locked first (FOR UPDATE), so two reviewers approving
- * at once cannot both insert: the second waits, then sees it is no longer
- * pending.
+ *   wording not in the catalogue  it joins public.behaviors and the report
+ *                                 is linked to the new row.
+ *   wording already there         nothing is added. The decision is only
+ *                                 the record that a reviewer read it.
+ *
+ * Either way the reviewer's corrections are applied to the report, with
+ * the previous value of each field kept in messages.edits.
  */
 export async function approveMessage(req, res) {
   const body = req.body
 
   const result = await withTransaction(async (client) => {
-    const { rows } = await client.query(
-      `select m.message_id, m.status, m.new_hook_text, m.report_id,
-              r.space, r.category_key, r.category_label,
-              r.behavior_name, r.target_type, r.target_name, r.target_worker_id,
-              r.locality_name, r.locality_code, r.occurred_at, r.occurred_text,
-              r.notes
-         from public.messages m
-         left join public.reports r on r.id = m.report_id
-        where m.message_id = $1
-        for update of m`,
-      [req.params.id],
-    )
+    const report = await lockForReview(client, req.params.id)
 
-    const message = rows[0]
-    if (!message) throw AppError.notFound('ההודעה לא נמצאה.')
-    if (message.status !== 'pending') {
-      throw AppError.conflict(`ההודעה כבר טופלה (${message.status}).`)
-    }
-    // The space comes only from the report. Without it there is no way to
-    // know which wizard the behaviour belongs in, and guessing would put it
-    // in front of the wrong people.
-    if (!message.space) {
-      throw AppError.badRequest('ה-Hook המקורי נמחק, ולכן לא ידוע לאיזה מרחב לשייך אותו.')
-    }
+    const space = body.space ?? report.space
+    const name = body.name ?? report.behavior_name
+    let behavior = null
 
-    const space = body.space ?? message.space
-    const name = body.name ?? message.new_hook_text
+    if (!report.behavior_id) {
+      // The reviewer's choice wins; otherwise whatever the reporter picked.
+      const category = await resolveCategory(client, space, {
+        key: body.categoryKey ?? (body.categoryLabel ? null : report.category_key),
+        label: body.categoryKey ? null : (body.categoryLabel ?? report.category_label),
+      })
 
-    // The reviewer's choice wins; otherwise whatever the reporter picked.
-    const category = await resolveCategory(client, space, {
-      key: body.categoryKey ?? (body.categoryLabel ? null : message.category_key),
-      label: body.categoryKey ? null : (body.categoryLabel ?? message.category_label),
-    })
+      behavior = await addToCatalogue(client, { space, name, category })
 
-    const behavior = await addToCatalogue(client, { space, name, category })
-
-    // The Hook now points at a real catalogue row, so it counts alongside
-    // every later report of the same behaviour - and carries whatever the
-    // reviewer corrected. `edits` holds what each field used to say.
-    const edits = message.report_id ? await applyReviewEdits(client, message, body, name) : null
-
-    if (message.report_id) {
+      // The Hook now points at a real catalogue row, so it counts alongside
+      // every later report of the same behaviour.
       await client.query(
         `update public.reports set behavior_id = $1 where id = $2 and behavior_id is null`,
-        [behavior.id, message.report_id],
+        [behavior.id, report.report_id],
       )
     }
 
-    const { rows: handled } = await client.query(
-      `update public.messages
-          set status = 'approved', handled_at = now(), handled_by = $2,
-              handling_note = $3, behavior_id = $4,
-              new_hook_text = $5, edits = $6
-        where message_id = $1
-        returning message_id, status, handled_at, edits`,
-      [
-        message.message_id,
-        req.user.id,
-        body.note ?? null,
-        behavior.id,
-        name,
-        edits ? JSON.stringify(edits) : null,
-      ],
-    )
+    const edits = await applyReviewEdits(client, report, body, name)
 
-    return { ...handled[0], behavior: describeBehavior(behavior) }
+    const decision = await recordDecision(client, {
+      report,
+      status: 'approved',
+      userId: req.user.id,
+      note: body.note,
+      name,
+      behaviorId: behavior?.id,
+      edits,
+    })
+
+    return { ...decision, behavior: behavior ? describeBehavior(behavior) : null }
   })
 
   res.json(result)

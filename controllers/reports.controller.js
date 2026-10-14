@@ -39,15 +39,40 @@ const momentFields = {
   notes: optionalText(1000),
 }
 
-export const createReportSchema = z.object({
-  behaviorId: z.uuid('התנהגות לא תקינה'),
-  ...momentFields,
-  // After the spread, so it overrides the optional one above.
-  localityName,
-  photoPublicId: optionalText(200),
-})
-
 export const TARGET_TYPES = ['employee', 'my_org', 'local_authority', 'business']
+
+export const createReportSchema = z
+  .object({
+    behaviorId: z.uuid('התנהגות לא תקינה'),
+    // Locality stays optional HERE and is required by the handler for work
+    // and community. The consumption form asks for a business instead, and
+    // which form applies depends on the behaviour's space - read from the
+    // catalogue row, not the request, so a schema cannot decide it.
+    ...momentFields,
+    photoPublicId: optionalText(200),
+
+    // Consumption space only (migration 030). The business itself travels
+    // as targetType 'business' + targetName.
+    businessAddress: optionalText(200),
+    staffName: optionalText(120),
+    placeText: optionalText(200),
+
+    // Who the Hook is about. Optional here and required by the HANDLER for
+    // the work space, because whether it is required depends on the
+    // behaviour's space - which is read from the catalogue row, not from
+    // the request. A schema cannot see that and must not guess at it.
+    targetType: z.enum(TARGET_TYPES).optional(),
+    targetName: optionalText(120),
+    targetWorkerId: z.uuid('עובד/ת לא תקין/ה').optional(),
+  })
+  .refine((v) => !(v.localityCode && !v.localityName), {
+    message: 'יש לציין את שם היישוב',
+    path: ['localityName'],
+  })
+  .refine((v) => v.targetType !== 'employee' || v.targetWorkerId || v.targetName, {
+    message: 'יש לבחור עובד/ת מהרשימה או להקליד שם',
+    path: ['targetName'],
+  })
 
 /** A behaviors.category_key: the slugs the catalogue already uses. */
 export const categoryKeySchema = z.string().trim().regex(/^[a-z0-9_]{1,60}$/, 'קטגוריה לא תקינה')
@@ -138,28 +163,81 @@ export async function createReport(req, res) {
 
   const organizationId = await organizationForReporter(req.user.id)
 
+  // A work-space Hook is about someone, and the rule hangs on the SPACE -
+  // which comes from the catalogue row above, never from the request. A
+  // client that omits the target cannot file an unattributed work Hook by
+  // claiming a different space.
+  if (behavior.space === 'work' && !body.targetType) {
+    throw AppError.badRequest('יש לציין על מי או על מה ה-Hook.')
+  }
+
+  // Each space's required "where", decided by the catalogue row's space:
+  //   consumption  the business (the town comes along with it if picked)
+  //   otherwise    the locality, as before
+  const consumption = behavior.space === 'consumption'
+  if (consumption) {
+    if (body.targetType && body.targetType !== 'business') {
+      throw AppError.badRequest('ב־Hook במרחב הצריכה יש לציין עסק.')
+    }
+    if (!body.targetName) throw AppError.badRequest('יש לציין את שם העסק.')
+    body.targetType = 'business'
+  } else if (!body.localityName) {
+    throw AppError.badRequest('יש לבחור יישוב או להשתמש בזיהוי מיקום.')
+  }
+
+  // A picked colleague must be in the reporter's own organisation - the
+  // same scope the list or search was served from (workerAccessFor). The
+  // name stored is the list's, so a client cannot attach one person's id
+  // to another's name. Identical to createCustomReport, deliberately: two
+  // rules for the same question is how one of them goes stale.
+  let targetName = body.targetName ?? null
+  if (body.targetWorkerId) {
+    const access = await workerAccessFor(req.user.id)
+    const worker = access && (await findWorker(access.organizationId, body.targetWorkerId))
+    if (!worker) throw AppError.badRequest('העובד/ת שנבחר/ה אינו/ה ברשימת הארגון שלך.')
+    targetName = worker.full_name
+  }
+
   const { rows } = await query(
     `insert into public.reports
        (space, behavior_id, behavior_name, locality_code, locality_name,
         occurred_at, occurred_text, notes, photo_public_id,
+        target_type, target_name, target_worker_id,
+        business_address, staff_name, place_text,
         user_id, organization_id)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $15, $16, $17, $13, $14)
      returning id, created_at`,
     [
       behavior.space,
       behavior.id,
       behavior.name,
       body.localityCode ?? null,
-      body.localityName,
+      body.localityName ?? null,
       body.occurredAt ?? null,
       body.occurredText ?? null,
       body.notes ?? null,
       body.photoPublicId ?? null,
+      body.targetType ?? null,
+      targetName,
+      body.targetWorkerId ?? null,
       req.user.id,
       organizationId,
+      // Consumption only - dropped for any other space rather than stored
+      // where nothing reads them.
+      consumption ? (body.businessAddress ?? null) : null,
+      consumption ? (body.staffName ?? null) : null,
+      consumption ? (body.placeText ?? null) : null,
     ],
   )
 
+  // NO MESSAGE ROW HERE, deliberately. public.messages is the approval
+  // queue: a row in it is something staff must DECIDE. A Hook filed
+  // against a behaviour already in the catalogue proposes nothing, so
+  // there is nothing to decide and it does not belong here.
+  //
+  // Every Hook is still visible to staff - HOOKS של משתמשים lists them
+  // all, with filters and a review-status column. That page is the answer
+  // to "show me everything"; this queue answers "what needs me".
   res.status(201).json({ filed: true, id: rows[0].id, createdAt: rows[0].created_at })
 }
 
